@@ -282,8 +282,9 @@ branch_and_bound_t<i_t, f_t>::branch_and_bound_t(
   }
 #endif
 
-  upper_bound_    = inf;
-  root_objective_ = std::numeric_limits<f_t>::quiet_NaN();
+  upper_bound_                 = inf;
+  root_lp_current_lower_bound_ = -inf;
+  root_objective_              = std::numeric_limits<f_t>::quiet_NaN();
 }
 
 template <typename i_t, typename f_t>
@@ -318,9 +319,19 @@ void branch_and_bound_t<i_t, f_t>::report_heuristic(f_t obj)
       user_gap.c_str(),
       toc(exploration_stats_.start_time));
   } else {
-    settings_.log.printf("New solution from primal heuristics. Objective %+.6e. Time %.2f\n",
-                         compute_user_objective(original_lp_, obj),
-                         toc(exploration_stats_.start_time));
+    f_t user_obj   = compute_user_objective(original_lp_, obj);
+    f_t user_lower = get_lower_bound();
+    if (!std::isfinite(user_lower)) {
+      f_t root_lower = root_lp_current_lower_bound_.load();
+      if (std::isfinite(root_lower)) { user_lower = root_lower; }
+    }
+    std::string gap_str = std::isfinite(user_lower)
+                            ? (". Gap: " + user_mip_gap<f_t>(user_obj, user_lower) + "\n")
+                            : "\n";
+    settings_.log.printf("New solution from primal heuristics. Objective %+.6e. Time %.2f%s",
+                         user_obj,
+                         toc(exploration_stats_.start_time),
+                         gap_str.c_str());
   }
 }
 
@@ -1943,6 +1954,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   log.log_prefix                      = settings_.log.log_prefix;
   solver_status_                      = mip_status_t::UNSET;
   is_running_                         = false;
+  root_lp_current_lower_bound_        = -inf;
   exploration_stats_.nodes_unexplored = 0;
   exploration_stats_.nodes_explored   = 0;
   original_lp_.A.to_compressed_row(Arow_);
@@ -1972,6 +1984,9 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   lp_settings.inside_mip                = 1;
   lp_settings.scale_columns             = false;
   lp_settings.concurrent_halt           = get_root_concurrent_halt();
+  lp_settings.root_lp_progress_callback = [this](f_t user_obj) {
+    root_lp_current_lower_bound_.store(user_obj);
+  };
   std::vector<i_t> basic_list(original_lp_.num_rows);
   std::vector<i_t> nonbasic_list;
   basis_update_mpf_t<i_t, f_t> basis_update(original_lp_.num_rows, settings_.refactor_frequency);

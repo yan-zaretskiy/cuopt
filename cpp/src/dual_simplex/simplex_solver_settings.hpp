@@ -110,6 +110,7 @@ struct simplex_solver_settings_t {
       sub_mip(0),
       solution_callback(nullptr),
       heuristic_preemption_callback(nullptr),
+      root_lp_progress_callback(nullptr),
       concurrent_halt(nullptr)
   {
   }
@@ -202,6 +203,8 @@ struct simplex_solver_settings_t {
   std::function<void(const std::vector<f_t>&, f_t)> node_processed_callback;
   std::function<void()> heuristic_preemption_callback;
   std::function<void(std::vector<f_t>&, std::vector<f_t>&, f_t)> set_simplex_solution_callback;
+  std::function<void(f_t)>
+    root_lp_progress_callback;  // Called with current dual obj during root LP
   mutable logger_t log;
   std::atomic<int>* concurrent_halt;  // if nullptr ignored, if !nullptr, 0 if solver should
                                       // continue, 1 if solver should halt

@@ -3520,6 +3520,9 @@ dual::status_t dual_phase2_with_advanced_basis(i_t phase,
                           primal_infeasibility_squared,
                           sum_perturb,
                           now);
+      if (phase == 2 && settings.inside_mip == 1 && settings.root_lp_progress_callback) {
+        settings.root_lp_progress_callback(compute_user_objective(lp, obj));
+      }
     }
 
     if (obj >= settings.cut_off) {
