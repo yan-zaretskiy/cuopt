@@ -312,9 +312,11 @@ void branch_and_bound_t<i_t, f_t>::report_heuristic(f_t obj)
     f_t lower      = get_lower_bound();
     f_t user_lower = std::isfinite(lower) ? compute_user_objective(original_lp_, lower) : -inf;
     if (exploration_stats_.nodes_explored == 0) {
-      f_t root_progress = root_lp_current_lower_bound_.load();
+      f_t root_progress          = root_lp_current_lower_bound_.load();
+      const bool is_maximization = original_lp_.obj_scale < 0.0;
       if (std::isfinite(root_progress) &&
-          (!std::isfinite(user_lower) || root_progress > user_lower)) {
+          (!std::isfinite(user_lower) ||
+           (is_maximization ? root_progress < user_lower : root_progress > user_lower))) {
         user_lower = root_progress;
       }
     }
@@ -327,17 +329,16 @@ void branch_and_bound_t<i_t, f_t>::report_heuristic(f_t obj)
       user_gap.c_str(),
       toc(exploration_stats_.start_time));
   } else {
-    f_t user_obj        = compute_user_objective(original_lp_, obj);
-    f_t lower           = get_lower_bound();
-    f_t user_lower      = std::isfinite(lower) ? compute_user_objective(original_lp_, lower)
-                                               : root_lp_current_lower_bound_.load();
-    std::string gap_str = std::isfinite(user_lower)
-                            ? (". Gap: " + user_mip_gap<f_t>(user_obj, user_lower) + "\n")
-                            : "\n";
-    settings_.log.printf("New solution from primal heuristics. Objective %+.6e. Time %.2f%s",
+    f_t user_obj   = compute_user_objective(original_lp_, obj);
+    f_t lower      = get_lower_bound();
+    f_t user_lower = std::isfinite(lower) ? compute_user_objective(original_lp_, lower)
+                                          : root_lp_current_lower_bound_.load();
+    std::string gap_str =
+      std::isfinite(user_lower) ? (". Gap: " + user_mip_gap<f_t>(user_obj, user_lower)) : "";
+    settings_.log.printf("New solution from primal heuristics. Objective %+.6e%s. Time %.2f\n",
                          user_obj,
-                         toc(exploration_stats_.start_time),
-                         gap_str.c_str());
+                         gap_str.c_str(),
+                         toc(exploration_stats_.start_time));
   }
 }
 
@@ -1960,6 +1961,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   log.log_prefix                      = settings_.log.log_prefix;
   solver_status_                      = mip_status_t::UNSET;
   is_running_                         = false;
+  lower_bound_ceiling_                = inf;
   root_lp_current_lower_bound_        = -inf;
   root_objective_                     = std::numeric_limits<f_t>::quiet_NaN();
   exploration_stats_.nodes_unexplored = 0;
