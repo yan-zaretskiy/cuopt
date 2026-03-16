@@ -525,6 +525,7 @@ void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
                       const std::vector<f_t> root_soln,
                       const std::vector<i_t>& fractional,
                       f_t root_obj,
+                      f_t upper_bound,
                       const std::vector<variable_status_t>& root_vstatus,
                       const std::vector<f_t>& edge_norms,
                       pseudo_costs_t<i_t, f_t>& pc);

@@ -31,6 +31,7 @@ void strong_branch_helper(i_t start,
                           const std::vector<variable_type_t>& var_types,
                           const std::vector<i_t>& fractional,
                           f_t root_obj,
+                          f_t upper_bound,
                           const std::vector<f_t>& root_soln,
                           const std::vector<variable_status_t>& root_vstatus,
                           const std::vector<f_t>& edge_norms,
@@ -62,6 +63,20 @@ void strong_branch_helper(i_t start,
       if (elapsed_time > settings.time_limit) { break; }
       child_settings.time_limit      = std::max(0.0, settings.time_limit - elapsed_time);
       child_settings.iteration_limit = 200;
+
+      if (std::isfinite(upper_bound)) {
+        child_settings.cut_off = upper_bound + settings.dual_tol;
+      } else {
+        child_settings.cut_off = 0;
+        for (i_t i = 0; i < original_lp.num_cols; ++i) {
+          if (original_lp.objective[i] < 0) {
+            child_settings.cut_off += original_lp.objective[i] * child_problem.upper[i];
+          } else if (original_lp.objective[i] > 0) {
+            child_settings.cut_off += original_lp.objective[i] * child_problem.lower[i];
+          }
+        }
+      }
+
       lp_solution_t<i_t, f_t> solution(original_lp.num_rows, original_lp.num_cols);
       i_t iter                               = 0;
       std::vector<variable_status_t> vstatus = root_vstatus;
@@ -168,9 +183,21 @@ f_t trial_branching(const lp_problem_t<i_t, f_t>& original_lp,
   i_t lp_iter_upper              = upper_max_lp_iter;
   i_t lp_iter_lower              = lower_max_lp_iter;
   child_settings.iteration_limit = std::clamp(bnb_lp_iter_per_node, lp_iter_lower, lp_iter_upper);
-  child_settings.cut_off         = upper_bound + settings.dual_tol;
   child_settings.inside_mip      = 2;
   child_settings.scale_columns   = false;
+
+  if (std::isfinite(upper_bound)) {
+    child_settings.cut_off = upper_bound + settings.dual_tol;
+  } else {
+    child_settings.cut_off = 0;
+    for (i_t i = 0; i < original_lp.num_cols; ++i) {
+      if (original_lp.objective[i] < 0) {
+        child_settings.cut_off += original_lp.objective[i] * child_problem.upper[i];
+      } else if (original_lp.objective[i] > 0) {
+        child_settings.cut_off += original_lp.objective[i] * child_problem.lower[i];
+      }
+    }
+  }
 
   lp_solution_t<i_t, f_t> solution(original_lp.num_rows, original_lp.num_cols);
   i_t iter                                         = 0;
@@ -305,6 +332,7 @@ void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
                       const std::vector<f_t> root_soln,
                       const std::vector<i_t>& fractional,
                       f_t root_obj,
+                      f_t upper_bound,
                       const std::vector<variable_status_t>& root_vstatus,
                       const std::vector<f_t>& edge_norms,
                       pseudo_costs_t<i_t, f_t>& pc)
@@ -429,6 +457,7 @@ void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
                              var_types,
                              fractional,
                              root_obj,
+                             upper_bound,
                              root_soln,
                              root_vstatus,
                              edge_norms,
@@ -784,6 +813,7 @@ template void strong_branching<int, double>(const user_problem_t<int, double>& o
                                             const std::vector<double> root_soln,
                                             const std::vector<int>& fractional,
                                             double root_obj,
+                                            double upper_bound,
                                             const std::vector<variable_status_t>& root_vstatus,
                                             const std::vector<double>& edge_norms,
                                             pseudo_costs_t<int, double>& pc);

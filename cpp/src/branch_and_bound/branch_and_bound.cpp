@@ -1175,7 +1175,6 @@ std::pair<node_status_t, rounding_direction_t> branch_and_bound_t<i_t, f_t>::upd
   dual::status_t lp_status,
   Policy& policy)
 {
-  constexpr f_t inf                      = std::numeric_limits<f_t>::infinity();
   const f_t abs_fathom_tol               = settings_.absolute_mip_gap_tol / 10;
   lp_problem_t<i_t, f_t>& leaf_problem   = worker->leaf_problem;
   lp_solution_t<i_t, f_t>& leaf_solution = worker->leaf_solution;
@@ -2456,6 +2455,7 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
                                root_relax_soln_.x,
                                fractional,
                                root_objective_,
+                               upper_bound_,
                                root_vstatus_,
                                edge_norms_,
                                pc_);
