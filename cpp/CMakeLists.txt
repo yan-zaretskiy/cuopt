@@ -109,6 +109,8 @@ if(BUILD_MSAN)
   add_link_options(-fsanitize=memory)
 endif(BUILD_MSAN)
 
+# Note: -UNDEBUG is applied via CUOPT_CXX_FLAGS / CUOPT_CUDA_FLAGS (not add_definitions)
+# to avoid leaking into dependencies that are built in-tree.
 if(DEFINE_ASSERT)
   add_definitions(-DASSERT_MODE)
   list(APPEND CUOPT_CXX_FLAGS -UNDEBUG)
@@ -185,11 +187,6 @@ elseif(CMAKE_CUDA_LINEINFO)
   list(APPEND CUOPT_CUDA_FLAGS -lineinfo)
   set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo")
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
-
-# Note: -UNDEBUG is applied via CUOPT_CXX_FLAGS / CUOPT_CUDA_FLAGS (not add_definitions)
-# to avoid leaking into dependencies that are built in-tree.
-# See the DEFINE_ASSERT block near the top of this file.
-
 
 # ##################################################################################################
 # - find CPM based dependencies  ------------------------------------------------------------------
