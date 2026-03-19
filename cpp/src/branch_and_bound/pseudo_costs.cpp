@@ -290,18 +290,18 @@ void strong_branch_helper(i_t start,
       child_settings.time_limit      = std::max(0.0, settings.time_limit - elapsed_time);
       child_settings.iteration_limit = 200;
 
-      if (std::isfinite(upper_bound)) {
-        child_settings.cut_off = upper_bound + settings.dual_tol;
-      } else {
-        child_settings.cut_off = 0;
-        for (i_t i = 0; i < original_lp.num_cols; ++i) {
-          if (original_lp.objective[i] < 0) {
-            child_settings.cut_off += original_lp.objective[i] * child_problem.upper[i];
-          } else if (original_lp.objective[i] > 0) {
-            child_settings.cut_off += original_lp.objective[i] * child_problem.lower[i];
-          }
-        }
-      }
+      // if (std::isfinite(upper_bound)) {
+      child_settings.cut_off = upper_bound + settings.dual_tol;
+      // } else {
+      //   child_settings.cut_off = 0;
+      //   for (i_t i = 0; i < original_lp.num_cols; ++i) {
+      //     if (original_lp.objective[i] < 0) {
+      //       child_settings.cut_off += original_lp.objective[i] * child_problem.upper[i];
+      //     } else if (original_lp.objective[i] > 0) {
+      //       child_settings.cut_off += original_lp.objective[i] * child_problem.lower[i];
+      //     }
+      //   }
+      // }
 
       lp_solution_t<i_t, f_t> solution(original_lp.num_rows, original_lp.num_cols);
       i_t iter                               = 0;
@@ -412,18 +412,18 @@ f_t trial_branching(const lp_problem_t<i_t, f_t>& original_lp,
   child_settings.inside_mip      = 2;
   child_settings.scale_columns   = false;
 
-  if (std::isfinite(upper_bound)) {
-    child_settings.cut_off = upper_bound + settings.dual_tol;
-  } else {
-    child_settings.cut_off = 0;
-    for (i_t i = 0; i < original_lp.num_cols; ++i) {
-      if (original_lp.objective[i] < 0) {
-        child_settings.cut_off += original_lp.objective[i] * child_problem.upper[i];
-      } else if (original_lp.objective[i] > 0) {
-        child_settings.cut_off += original_lp.objective[i] * child_problem.lower[i];
-      }
-    }
-  }
+  // if (std::isfinite(upper_bound)) {
+  child_settings.cut_off = upper_bound + settings.dual_tol;
+  // } else {
+  //   child_settings.cut_off = 0;
+  //   for (i_t i = 0; i < original_lp.num_cols; ++i) {
+  //     if (original_lp.objective[i] < 0) {
+  //       child_settings.cut_off += original_lp.objective[i] * child_problem.upper[i];
+  //     } else if (original_lp.objective[i] > 0) {
+  //       child_settings.cut_off += original_lp.objective[i] * child_problem.lower[i];
+  //     }
+  //   }
+  // }
 
   lp_solution_t<i_t, f_t> solution(original_lp.num_rows, original_lp.num_cols);
   i_t iter                                         = 0;
@@ -804,7 +804,6 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   const std::vector<variable_type_t>& var_types,
   const branch_and_bound_stats_t<i_t, f_t>& bnb_stats,
   const simplex_solver_settings_t<i_t, f_t>& settings,
-  f_t leaf_obj,
   f_t upper_bound,
   int max_num_tasks,
   logger_t& log)
@@ -964,7 +963,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
     return branch_var;
   }
 
-#pragma omp taskloop if (num_tasks > 1) priority(task_priority) num_tasks(num_tasks) \
+#pragma omp taskloop if (num_candidates > 5) priority(task_priority) num_tasks(num_tasks) \
   shared(score_mutex)
   for (i_t i = 0; i < num_candidates; ++i) {
     auto [score, j] = unreliable_list[i];

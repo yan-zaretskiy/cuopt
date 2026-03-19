@@ -843,7 +843,6 @@ branch_variable_t<i_t> branch_and_bound_t<i_t, f_t>::variable_selection(
                                                      var_types_,
                                                      exploration_stats_,
                                                      settings_,
-                                                     node_ptr->lower_bound,
                                                      upper_bound_,
                                                      worker_pool_.num_idle_workers(),
                                                      log);

@@ -484,7 +484,6 @@ class pseudo_costs_t {
                                   const std::vector<variable_type_t>& var_types,
                                   const branch_and_bound_stats_t<i_t, f_t>& bnb_stats,
                                   const simplex_solver_settings_t<i_t, f_t>& settings,
-                                  f_t leaf_obj,
                                   f_t upper_bound,
                                   int max_num_tasks,
                                   logger_t& log);
