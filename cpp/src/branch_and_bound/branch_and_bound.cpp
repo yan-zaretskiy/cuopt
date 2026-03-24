@@ -1970,14 +1970,6 @@ mip_status_t branch_and_bound_t<i_t, f_t>::solve(mip_solution_t<i_t, f_t>& solut
   settings_.log.printf("Reduced cost strengthening enabled: %d\n",
                        settings_.reduced_cost_strengthening);
 
-  if (settings_.reliability_branching == -2) {
-    settings_.log.printf("Enabled objective estimation via dual simplex\n");
-    pc_.reliability_branching_settings.rank_candidates_with_dual_pivot = true;
-  } else {
-    settings_.log.printf("Disabled objective estimation via dual simplex\n");
-    pc_.reliability_branching_settings.rank_candidates_with_dual_pivot = false;
-  }
-
   variable_bounds_t<i_t, f_t> variable_bounds(
     original_lp_, settings_, var_types_, Arow_, new_slacks_);
 
