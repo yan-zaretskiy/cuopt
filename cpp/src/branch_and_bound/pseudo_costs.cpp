@@ -901,15 +901,6 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
     reliable_threshold);
 
   if (unreliable_list.size() > max_num_candidates) {
-    std::cout << std::format(
-      "RB iters = {}, B&B iters = {}, unreliable = {}, num_tasks = {}, "
-      "reliable_threshold = {}\n",
-      strong_branching_lp_iter.load(),
-      branch_and_bound_lp_iters,
-      unreliable_list.size(),
-      num_tasks,
-      reliable_threshold);
-
     if (reliability_branching_settings.rank_candidates_with_dual_pivot) {
       i_t m             = worker->leaf_problem.num_rows;
       i_t n             = worker->leaf_problem.num_cols;
@@ -971,7 +962,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
     return branch_var;
   }
 
-#pragma omp taskloop if (num_candidates > 5) priority(task_priority) num_tasks(num_tasks) \
+#pragma omp taskloop if (num_candidates > 1) priority(task_priority) num_tasks(num_tasks) \
   shared(score_mutex)
   for (i_t i = 0; i < num_candidates; ++i) {
     auto [score, j] = unreliable_list[i];

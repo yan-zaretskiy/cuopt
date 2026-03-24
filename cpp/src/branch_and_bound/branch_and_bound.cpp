@@ -789,25 +789,6 @@ void branch_and_bound_t<i_t, f_t>::add_feasible_solution(f_t leaf_objective,
     upper_bound_ = leaf_objective;
     report(feasible_solution_symbol(thread_type), leaf_objective, get_lower_bound(), leaf_depth, 0);
     send_solution = true;
-
-    f_t upper      = upper_bound_;
-    f_t lower      = get_lower_bound();
-    f_t user_upper = compute_user_objective(original_lp_, upper);
-    f_t user_lower = compute_user_objective(original_lp_, lower);
-
-    std::cout << std::format(
-                   "{}: user_obj={:.3g}, solver_obj={:.3g}, user_lower={:.3g}, "
-                   "solver_lower={:.3g}, user_gap={:.3g}, "
-                   "solver_gap={:.3g}, tol={:.3g}",
-                   feasible_solution_symbol(thread_type),
-                   user_upper,
-                   upper,
-                   user_lower,
-                   lower,
-                   std::abs(user_upper - user_lower),
-                   std::abs(upper - lower),
-                   settings_.absolute_mip_gap_tol)
-              << std::endl;
   }
 
   if (send_solution && settings_.solution_callback != nullptr) {
