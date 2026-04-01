@@ -943,9 +943,7 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
           }
         }
 
-        if (bounded) {
-          removed_free_variables++;
-        }
+        if (bounded) { removed_free_variables++; }
       }
     }
 
@@ -959,7 +957,6 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     assert(new_free_variables == free_variables - removed_free_variables);
     free_variables = new_free_variables;
   }
-
 
   // The original problem may have a variable without a lower bound
   // but a finite upper bound
@@ -988,6 +985,24 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
         const i_t col_end   = problem.A.col_start[j + 1];
         for (i_t p = col_start; p < col_end; p++) {
           problem.A.x[p] *= -1.0;
+        }
+      }
+    }
+
+    // (1/2) x^T Q x with x = D x' (D_ii = -1 for negated columns) is (1/2) x'^T D Q D x'.
+    // One pass: Q'_{ik} = D_{ii} D_{kk} Q_{ik} — flip iff exactly one of {i,k} is negated.
+    if (problem.Q.n > 0 && !presolve_info.negated_variables.empty()) {
+      std::vector<bool> is_negated(static_cast<size_t>(problem.num_cols), false);
+      for (i_t const j : presolve_info.negated_variables) {
+        is_negated[static_cast<size_t>(j)] = true;
+      }
+      for (i_t row = 0; row < problem.Q.m; ++row) {
+        const i_t q_start         = problem.Q.row_start[row];
+        const i_t q_end           = problem.Q.row_start[row + 1];
+        const bool is_negated_row = is_negated[static_cast<size_t>(row)];
+        for (i_t p = q_start; p < q_end; ++p) {
+          const i_t col = problem.Q.j[p];
+          if (is_negated_row != is_negated[static_cast<size_t>(col)]) { problem.Q.x[p] *= -1.0; }
         }
       }
     }
