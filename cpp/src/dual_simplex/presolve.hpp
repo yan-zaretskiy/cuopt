@@ -203,7 +203,6 @@ struct presolve_info_t {
 
   folding_info_t<i_t, f_t> folding_info;
 
-  std::vector<i_t> new_slacks;
   // Variables that were negated to handle -inf < x_j <= u_j
   std::vector<i_t> negated_variables;
 };
