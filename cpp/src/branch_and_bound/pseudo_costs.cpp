@@ -281,11 +281,12 @@ void strong_branch_helper(i_t start,
                           const simplex_solver_settings_t<i_t, f_t>& settings,
                           const std::vector<variable_type_t>& var_types,
                           const std::vector<i_t>& fractional,
-                          f_t root_obj,
-                          f_t upper_bound,
                           const std::vector<f_t>& root_soln,
                           const std::vector<variable_status_t>& root_vstatus,
                           const std::vector<f_t>& edge_norms,
+                          f_t root_obj,
+                          f_t upper_bound,
+                          i_t iter_limit,
                           pseudo_costs_t<i_t, f_t>& pc)
 {
   raft::common::nvtx::range scope("BB::strong_branch_helper");
@@ -313,7 +314,7 @@ void strong_branch_helper(i_t start,
       f_t elapsed_time  = toc(start_time);
       if (elapsed_time > settings.time_limit) { break; }
       child_settings.time_limit      = std::max(0.0, settings.time_limit - elapsed_time);
-      child_settings.iteration_limit = 200;
+      child_settings.iteration_limit = iter_limit;
       child_settings.cut_off =
         objective_upper_bound(child_problem, upper_bound, child_settings.dual_tol);
 
@@ -656,8 +657,11 @@ void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
                         settings.num_threads,
                         fractional.size());
     f_t strong_branching_start_time = tic();
+    i_t simplex_iteration_limit     = settings.strong_branching_simplex_iteration_limit < 0
+                                        ? 200
+                                        : settings.strong_branching_simplex_iteration_limit;
 
-    if (settings.mip_strong_branching_use_pivot_estimation) {
+    if (simplex_iteration_limit < 1) {
       initialize_pseudo_costs_with_estimate(original_lp,
                                             settings,
                                             root_vstatus,
@@ -696,11 +700,12 @@ void strong_branching(const user_problem_t<i_t, f_t>& original_problem,
                                settings,
                                var_types,
                                fractional,
-                               root_obj,
-                               upper_bound,
                                root_solution.x,
                                root_vstatus,
                                edge_norms,
+                               root_obj,
+                               upper_bound,
+                               simplex_iteration_limit,
                                pc);
         }
       }
