@@ -920,26 +920,39 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
         // And we can derive two bounds from this:
         // x_j >= 1/a_ij * (rhs - lower_activity_i)
         // x_j <= 1/a_ij * (rhs - upper_activity_i)
-        const i_t j    = last_free_i;
-        const f_t a_ij = last_free_coeff_i;
-        bool bounded   = false;
+        const i_t j         = last_free_i;
+        const f_t a_ij      = last_free_coeff_i;
+        const f_t max_bound = 1e10;
+        bool bounded        = false;
         if (a_ij > 0) {
           if (lower_inf_i == 1) {
-            problem.upper[j] = 1.0 / a_ij * (rhs - lower_activity_i);
-            bounded          = true;
+            const f_t new_upper = 1.0 / a_ij * (rhs - lower_activity_i);
+            if (new_upper < max_bound) {
+              problem.upper[j] = new_upper;
+              bounded          = true;
+            }
           }
           if (upper_inf_i == 1) {
-            problem.lower[j] = 1.0 / a_ij * (rhs - upper_activity_i);
-            bounded          = true;
+            const f_t new_lower = 1.0 / a_ij * (rhs - upper_activity_i);
+            if (new_lower > -max_bound) {
+              problem.lower[j] = new_lower;
+              bounded          = true;
+            }
           }
         } else if (a_ij < 0) {
           if (lower_inf_i == 1) {
-            problem.lower[j] = 1.0 / a_ij * (rhs - lower_activity_i);
-            bounded          = true;
+            const f_t new_lower = 1.0 / a_ij * (rhs - lower_activity_i);
+            if (new_lower > -max_bound) {
+              problem.lower[j] = new_lower;
+              bounded          = true;
+            }
           }
           if (upper_inf_i == 1) {
-            problem.upper[j] = 1.0 / a_ij * (rhs - upper_activity_i);
-            bounded          = true;
+            const f_t new_upper = 1.0 / a_ij * (rhs - upper_activity_i);
+            if (new_upper < max_bound) {
+              problem.upper[j] = new_upper;
+              bounded          = true;
+            }
           }
         }
 
