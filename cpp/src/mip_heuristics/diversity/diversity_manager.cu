@@ -225,6 +225,7 @@ bool diversity_manager_t<i_t, f_t>::run_presolve(f_t time_limit, timer_t global_
   raft::common::nvtx::range fun_scope("run_presolve");
   CUOPT_LOG_INFO("Running presolve!");
   timer_t presolve_timer(time_limit);
+
   auto term_crit = ls.constraint_prop.bounds_update.solve(*problem_ptr);
   if (ls.constraint_prop.bounds_update.infeas_constraints_count > 0) {
     stats.presolve_time = timer.elapsed_time();
@@ -464,23 +465,25 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
   } else if (!fj_only_run) {
     convert_greater_to_less(*problem_ptr);
 
-    f_t tolerance_divisor =
-      problem_ptr->tolerances.absolute_tolerance / problem_ptr->tolerances.relative_tolerance;
-    if (tolerance_divisor == 0) { tolerance_divisor = 1; }
     f_t absolute_tolerance = context.settings.tolerances.absolute_tolerance;
 
     pdlp_solver_settings_t<i_t, f_t> pdlp_settings{};
-    pdlp_settings.tolerances.relative_primal_tolerance = absolute_tolerance / tolerance_divisor;
-    pdlp_settings.tolerances.relative_dual_tolerance   = absolute_tolerance / tolerance_divisor;
-    pdlp_settings.time_limit                           = lp_time_limit;
-    pdlp_settings.first_primal_feasible                = false;
-    pdlp_settings.concurrent_halt                      = &global_concurrent_halt;
-    pdlp_settings.method                               = method_t::Concurrent;
-    pdlp_settings.inside_mip                           = true;
-    pdlp_settings.pdlp_solver_mode                     = pdlp_solver_mode_t::Stable2;
-    pdlp_settings.num_gpus                             = context.settings.num_gpus;
-    pdlp_settings.presolver                            = presolver_t::None;
-
+    pdlp_settings.tolerances.absolute_dual_tolerance = absolute_tolerance;
+    pdlp_settings.tolerances.relative_dual_tolerance =
+      context.settings.tolerances.relative_tolerance;
+    pdlp_settings.tolerances.absolute_primal_tolerance = absolute_tolerance;
+    pdlp_settings.tolerances.relative_primal_tolerance =
+      context.settings.tolerances.relative_tolerance;
+    pdlp_settings.time_limit              = lp_time_limit;
+    pdlp_settings.first_primal_feasible   = false;
+    pdlp_settings.concurrent_halt         = &global_concurrent_halt;
+    pdlp_settings.method                  = method_t::Concurrent;
+    pdlp_settings.inside_mip              = true;
+    pdlp_settings.pdlp_solver_mode        = pdlp_solver_mode_t::Stable2;
+    pdlp_settings.num_gpus                = context.settings.num_gpus;
+    pdlp_settings.presolver               = presolver_t::None;
+    pdlp_settings.per_constraint_residual = true;
+    set_pdlp_solver_mode(pdlp_settings);
     timer_t lp_timer(lp_time_limit);
     auto lp_result = solve_lp_with_method<i_t, f_t>(*problem_ptr, pdlp_settings, lp_timer);
 
@@ -512,7 +515,11 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
     ls.lp_optimal_exists = true;
     if (!use_staged_simplex_solution) {
       if (lp_result.get_termination_status() == pdlp_termination_status_t::Optimal) {
-        set_new_user_bound(lp_result.get_objective_value());
+        solution_t<i_t, f_t> lp_sol(*problem_ptr);
+        lp_sol.copy_new_assignment(lp_optimal_solution);
+        const bool consider_integrality = false;
+        lp_sol.compute_feasibility(consider_integrality);
+        if (lp_sol.get_feasible()) { set_new_user_bound(lp_result.get_objective_value()); }
       } else if (lp_result.get_termination_status() ==
                  pdlp_termination_status_t::PrimalInfeasible) {
         CUOPT_LOG_ERROR("Problem is primal infeasible, continuing anyway!");
