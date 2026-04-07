@@ -349,7 +349,17 @@ lp_status_t solve_linear_program_with_barrier(const user_problem_t<i_t, f_t>& us
   if (!user_problem.second_order_cone_dims.empty()) {
     i_t cone_end = user_problem.cone_var_start;
     for (auto q_k : user_problem.second_order_cone_dims) {
+      if (q_k <= 1) {
+        settings.log.printf(
+          "Error: second-order cone dimensions must be at least 2; use linear variables instead of "
+          "Q^1\n");
+        return lp_status_t::NUMERICAL_ISSUES;
+      }
       cone_end += q_k;
+    }
+    if (cone_end != user_problem.num_cols) {
+      settings.log.printf("Error: conic variables must form a trailing block [linear | cone]\n");
+      return lp_status_t::NUMERICAL_ISSUES;
     }
     for (i_t j = user_problem.cone_var_start; j < cone_end; ++j) {
       if (user_problem.lower[j] != 0.0 && user_problem.lower[j] > -1e30) {

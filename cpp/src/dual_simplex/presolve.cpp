@@ -20,10 +20,15 @@
 namespace cuopt::linear_programming::dual_simplex {
 
 template <typename i_t, typename f_t>
+static i_t linear_var_count(const lp_problem_t<i_t, f_t>& problem)
+{
+  return problem.second_order_cone_dims.empty() ? problem.num_cols : problem.cone_var_start;
+}
+
+template <typename i_t, typename f_t>
 i_t remove_empty_cols(lp_problem_t<i_t, f_t>& problem,
                       i_t& num_empty_cols,
-                      presolve_info_t<i_t, f_t>& presolve_info,
-                      const std::vector<bool>& is_cone_variable)
+                      presolve_info_t<i_t, f_t>& presolve_info)
 {
   constexpr bool verbose = false;
   if (verbose) { printf("Removing %d empty columns\n", num_empty_cols); }
@@ -32,9 +37,10 @@ i_t remove_empty_cols(lp_problem_t<i_t, f_t>& problem,
   presolve_info.removed_reduced_costs.reserve(num_empty_cols);
 
   std::vector<bool> has_quadratic_term(problem.num_cols, false);
+  i_t linear_cols = linear_var_count(problem);
 
   if (problem.Q.n > 0) {
-    for (i_t j = 0; j < problem.num_cols; ++j) {
+    for (i_t j = 0; j < linear_cols; ++j) {
       const i_t row_start = problem.Q.row_start[j];
       const i_t row_end   = problem.Q.row_start[j + 1];
       if (row_end - row_start == 0) { continue; }
@@ -46,8 +52,8 @@ i_t remove_empty_cols(lp_problem_t<i_t, f_t>& problem,
   i_t new_cols = 0;
   for (i_t j = 0; j < problem.num_cols; ++j) {
     bool remove_var = false;
-    if ((problem.A.col_start[j + 1] - problem.A.col_start[j]) == 0) {
-      bool non_removable = has_quadratic_term[j] || is_cone_variable[j];
+    if (j < linear_cols && (problem.A.col_start[j + 1] - problem.A.col_start[j]) == 0) {
+      bool non_removable = has_quadratic_term[j];
       if (problem.objective[j] >= 0 && problem.lower[j] > -inf && !non_removable) {
         presolve_info.removed_values.push_back(problem.lower[j]);
         problem.obj_constant += problem.objective[j] * problem.lower[j];
@@ -113,6 +119,12 @@ i_t remove_empty_cols(lp_problem_t<i_t, f_t>& problem,
     problem.Q.m = new_cols;
     problem.Q.n = new_cols;
     problem.Q.check_matrix("After removing empty columns");
+  }
+
+  if (!problem.second_order_cone_dims.empty()) {
+    i_t new_cone_start = col_old_to_new[problem.cone_var_start];
+    assert(new_cone_start != -1);
+    problem.cone_var_start = new_cone_start;
   }
 
   problem.objective = objective;
@@ -263,6 +275,113 @@ i_t convert_less_than_to_equal(const user_problem_t<i_t, f_t>& user_problem,
   }
   // We must convert rows in the form: a_i^T x <= beta
   // into: a_i^T x + s_i = beta, s_i >= 0
+
+  if (!problem.second_order_cone_dims.empty()) {
+    const i_t old_num_cols   = problem.num_cols;
+    const i_t linear_cols    = linear_var_count(problem);
+    const i_t num_slacks     = less_rows;
+    const i_t num_cols       = old_num_cols + num_slacks;
+    const i_t old_nnz        = problem.A.col_start[old_num_cols];
+    const i_t nnz            = old_nnz + num_slacks;
+    const i_t new_cone_start = linear_cols + num_slacks;
+
+    auto old_A = problem.A;
+    csc_matrix_t<i_t, f_t> expanded_A(problem.A.m, num_cols, nnz);
+
+    std::vector<f_t> objective(num_cols, 0.0);
+    std::vector<f_t> lower(num_cols, 0.0);
+    std::vector<f_t> upper(num_cols, INFINITY);
+    std::vector<i_t> old_to_new(old_num_cols, -1);
+
+    for (i_t j = 0; j < linear_cols; ++j) {
+      old_to_new[j] = j;
+      objective[j]  = problem.objective[j];
+      lower[j]      = problem.lower[j];
+      upper[j]      = problem.upper[j];
+    }
+    for (i_t j = linear_cols; j < old_num_cols; ++j) {
+      old_to_new[j]            = j + num_slacks;
+      objective[old_to_new[j]] = problem.objective[j];
+      lower[old_to_new[j]]     = problem.lower[j];
+      upper[old_to_new[j]]     = problem.upper[j];
+    }
+
+    i_t nz = 0;
+    for (i_t j = 0; j < linear_cols; ++j) {
+      expanded_A.col_start[j] = nz;
+      for (i_t p = old_A.col_start[j]; p < old_A.col_start[j + 1]; ++p) {
+        expanded_A.i[nz] = old_A.i[p];
+        expanded_A.x[nz] = old_A.x[p];
+        ++nz;
+      }
+    }
+
+    i_t slack_col = linear_cols;
+    for (i_t i = 0; i < problem.num_rows; i++) {
+      if (row_sense[i] == 'L') {
+        expanded_A.col_start[slack_col] = nz;
+        expanded_A.i[nz]                = i;
+        expanded_A.x[nz]                = 1.0;
+        new_slacks.push_back(slack_col);
+        row_sense[i] = 'E';
+        ++slack_col;
+        ++nz;
+        --less_rows;
+      }
+    }
+
+    for (i_t j = linear_cols; j < old_num_cols; ++j) {
+      i_t new_j                   = old_to_new[j];
+      expanded_A.col_start[new_j] = nz;
+      for (i_t p = old_A.col_start[j]; p < old_A.col_start[j + 1]; ++p) {
+        expanded_A.i[nz] = old_A.i[p];
+        expanded_A.x[nz] = old_A.x[p];
+        ++nz;
+      }
+    }
+    expanded_A.col_start[num_cols] = nz;
+    assert(less_rows == 0);
+    assert(slack_col == new_cone_start);
+    assert(nz == nnz);
+
+    if (problem.Q.n > 0) {
+      const auto old_Q = problem.Q;
+      const i_t q_nnz  = old_Q.row_start[old_num_cols];
+
+      problem.Q.row_start.assign(num_cols + 1, 0);
+      for (i_t row = 0; row < old_num_cols; ++row) {
+        i_t new_row                      = old_to_new[row];
+        problem.Q.row_start[new_row + 1] = old_Q.row_start[row + 1] - old_Q.row_start[row];
+      }
+      for (i_t row = 0; row < num_cols; ++row) {
+        problem.Q.row_start[row + 1] += problem.Q.row_start[row];
+      }
+
+      problem.Q.j.resize(q_nnz);
+      problem.Q.x.resize(q_nnz);
+      auto row_starts = problem.Q.row_start;
+      for (i_t row = 0; row < old_num_cols; ++row) {
+        i_t new_row = old_to_new[row];
+        for (i_t p = old_Q.row_start[row]; p < old_Q.row_start[row + 1]; ++p) {
+          problem.Q.j[row_starts[new_row]] = old_to_new[old_Q.j[p]];
+          problem.Q.x[row_starts[new_row]] = old_Q.x[p];
+          ++row_starts[new_row];
+        }
+      }
+      problem.Q.m      = num_cols;
+      problem.Q.n      = num_cols;
+      problem.Q.nz_max = q_nnz;
+    }
+
+    problem.A              = expanded_A;
+    problem.A.n            = num_cols;
+    problem.objective      = objective;
+    problem.lower          = lower;
+    problem.upper          = upper;
+    problem.num_cols       = num_cols;
+    problem.cone_var_start = new_cone_start;
+    return 0;
+  }
 
   i_t num_cols = problem.num_cols + less_rows;
   i_t nnz      = problem.A.col_start[problem.num_cols] + less_rows;
@@ -817,26 +936,10 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
 {
   problem = original;
   std::vector<char> row_sense(problem.num_rows, '=');
-  auto build_is_cone_variable = [](const lp_problem_t<i_t, f_t>& current_problem) {
-    std::vector<bool> is_cone_variable(current_problem.num_cols, false);
-    if (!current_problem.second_order_cone_dims.empty()) {
-      i_t cone_end = current_problem.cone_var_start;
-      for (auto q_k : current_problem.second_order_cone_dims) {
-        cone_end += q_k;
-      }
-      for (i_t j = current_problem.cone_var_start; j < cone_end; ++j) {
-        is_cone_variable[j] = true;
-      }
-    }
-    return is_cone_variable;
-  };
-  auto is_cone_variable = build_is_cone_variable(problem);
   // Check for free variables
   i_t free_variables = 0;
-  for (i_t j = 0; j < problem.num_cols; j++) {
-    if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
-      free_variables++;
-    }
+  for (i_t j = 0; j < linear_var_count(problem); j++) {
+    if (problem.lower[j] == -inf && problem.upper[j] == inf) { free_variables++; }
   }
 
   if (settings.barrier_presolve && free_variables > 0) {
@@ -846,8 +949,8 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     std::vector<i_t> row_marked(problem.num_rows, 0);
     current_free_variables.reserve(problem.num_cols);
     constraints_to_check.reserve(problem.num_rows);
-    for (i_t j = 0; j < problem.num_cols; j++) {
-      if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
+    for (i_t j = 0; j < linear_var_count(problem); j++) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf) {
         current_free_variables.push_back(j);
         const i_t col_start = problem.A.col_start[j];
         const i_t col_end   = problem.A.col_start[j + 1];
@@ -986,10 +1089,8 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     }
 
     i_t new_free_variables = 0;
-    for (i_t j = 0; j < problem.num_cols; j++) {
-      if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
-        new_free_variables++;
-      }
+    for (i_t j = 0; j < linear_var_count(problem); j++) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf) { new_free_variables++; }
     }
     if (removed_free_variables != 0) {
       settings.log.printf("Bounded %d free variables\n", removed_free_variables);
@@ -997,7 +1098,6 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     assert(new_free_variables == free_variables - removed_free_variables);
     free_variables = new_free_variables;
   }
-
   // The original problem may have a variable without a lower bound
   // but a finite upper bound
   // -inf < x_j <= u_j
@@ -1142,23 +1242,19 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
   // Check for empty cols
   i_t num_empty_cols = 0;
   {
-    for (i_t j = 0; j < problem.num_cols; ++j) {
+    for (i_t j = 0; j < linear_var_count(problem); ++j) {
       if ((problem.A.col_start[j + 1] - problem.A.col_start[j]) == 0) { num_empty_cols++; }
     }
   }
   if (num_empty_cols > 0) {
     settings.log.printf("Presolve attempt to remove %d empty cols\n", num_empty_cols);
-    remove_empty_cols(problem, num_empty_cols, presolve_info, is_cone_variable);
+    remove_empty_cols(problem, num_empty_cols, presolve_info);
   }
-
-  is_cone_variable = build_is_cone_variable(problem);
 
   // Check for free variables (exclude cone variables — they are naturally unbounded)
   free_variables = 0;
-  for (i_t j = 0; j < problem.num_cols; j++) {
-    if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
-      free_variables++;
-    }
+  for (i_t j = 0; j < linear_var_count(problem); j++) {
+    if (problem.lower[j] == -inf && problem.upper[j] == inf) { free_variables++; }
   }
   problem.Q.check_matrix("Before free variable expansion");
 
@@ -1175,123 +1271,164 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     // becomes
     // sum_{k != j} c_k x_k + c_j v - c_j w
 
-    std::vector<i_t> pair_index(problem.num_cols, -1);
-    i_t num_cols = problem.num_cols + free_variables;
-    i_t nnz      = problem.A.col_start[problem.num_cols];
-    for (i_t j = 0; j < problem.num_cols; j++) {
-      if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
-        nnz += (problem.A.col_start[j + 1] - problem.A.col_start[j]);
+    const i_t old_num_cols = problem.num_cols;
+    const i_t linear_cols  = linear_var_count(problem);
+    const i_t new_cone_start =
+      problem.second_order_cone_dims.empty() ? 0 : linear_cols + free_variables;
+    const i_t num_cols = old_num_cols + free_variables;
+
+    auto old_A         = problem.A;
+    auto old_Q         = problem.Q;
+    auto old_objective = problem.objective;
+    auto old_lower     = problem.lower;
+    auto old_upper     = problem.upper;
+
+    std::vector<i_t> partner_index(old_num_cols, -1);
+    std::vector<i_t> orig_to_new(old_num_cols, -1);
+    std::vector<bool> is_free(old_num_cols, false);
+
+    i_t next_partner = linear_cols;
+    for (i_t j = 0; j < linear_cols; ++j) {
+      orig_to_new[j] = j;
+      if (old_lower[j] == -inf && old_upper[j] == inf) {
+        is_free[j]       = true;
+        partner_index[j] = next_partner++;
       }
     }
+    for (i_t j = linear_cols; j < old_num_cols; ++j) {
+      orig_to_new[j] = j + free_variables;
+    }
+    assert(next_partner == new_cone_start || problem.second_order_cone_dims.empty());
 
-    problem.A.col_start.resize(num_cols + 1);
-    problem.A.i.resize(nnz);
-    problem.A.x.resize(nnz);
-    problem.lower.resize(num_cols);
-    problem.upper.resize(num_cols);
-    problem.objective.resize(num_cols);
+    i_t nnz = old_A.col_start[old_num_cols];
+    for (i_t j = 0; j < linear_cols; ++j) {
+      if (is_free[j]) { nnz += old_A.col_start[j + 1] - old_A.col_start[j]; }
+    }
 
-    presolve_info.free_variable_pairs.resize(free_variables * 2);
-    i_t pair_count = 0;
-    i_t q          = problem.A.col_start[problem.num_cols];
-    i_t col        = problem.num_cols;
-    for (i_t j = 0; j < problem.num_cols; j++) {
-      if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
-        for (i_t p = problem.A.col_start[j]; p < problem.A.col_start[j + 1]; p++) {
-          i_t i          = problem.A.i[p];
-          f_t aij        = problem.A.x[p];
-          problem.A.i[q] = i;
-          problem.A.x[q] = -aij;
-          q++;
+    csc_matrix_t<i_t, f_t> expanded_A(problem.A.m, num_cols, nnz);
+    i_t nz = 0;
+    for (i_t j = 0; j < linear_cols; ++j) {
+      expanded_A.col_start[j] = nz;
+      for (i_t p = old_A.col_start[j]; p < old_A.col_start[j + 1]; ++p) {
+        expanded_A.i[nz] = old_A.i[p];
+        expanded_A.x[nz] = old_A.x[p];
+        ++nz;
+      }
+    }
+    for (i_t j = 0; j < linear_cols; ++j) {
+      if (partner_index[j] != -1) {
+        expanded_A.col_start[partner_index[j]] = nz;
+        for (i_t p = old_A.col_start[j]; p < old_A.col_start[j + 1]; ++p) {
+          expanded_A.i[nz] = old_A.i[p];
+          expanded_A.x[nz] = -old_A.x[p];
+          ++nz;
         }
-        problem.lower[col]                              = 0.0;
-        problem.upper[col]                              = inf;
-        problem.objective[col]                          = -problem.objective[j];
-        presolve_info.free_variable_pairs[pair_count++] = j;
-        presolve_info.free_variable_pairs[pair_count++] = col;
-        pair_index[j]                                   = col;
-        problem.A.col_start[++col]                      = q;
-        problem.lower[j]                                = 0.0;
       }
     }
+    for (i_t j = linear_cols; j < old_num_cols; ++j) {
+      i_t new_j                   = orig_to_new[j];
+      expanded_A.col_start[new_j] = nz;
+      for (i_t p = old_A.col_start[j]; p < old_A.col_start[j + 1]; ++p) {
+        expanded_A.i[nz] = old_A.i[p];
+        expanded_A.x[nz] = old_A.x[p];
+        ++nz;
+      }
+    }
+    expanded_A.col_start[num_cols] = nz;
 
-    if (problem.Q.n > 0) {
+    std::vector<f_t> objective(num_cols);
+    std::vector<f_t> lower(num_cols, -INFINITY);
+    std::vector<f_t> upper(num_cols, INFINITY);
+    presolve_info.free_variable_pairs.clear();
+    presolve_info.free_variable_pairs.reserve(free_variables * 2);
+
+    for (i_t j = 0; j < linear_cols; ++j) {
+      objective[j] = old_objective[j];
+      if (is_free[j]) {
+        lower[j]                    = 0.0;
+        upper[j]                    = inf;
+        objective[partner_index[j]] = -old_objective[j];
+        lower[partner_index[j]]     = 0.0;
+        upper[partner_index[j]]     = inf;
+        presolve_info.free_variable_pairs.push_back(j);
+        presolve_info.free_variable_pairs.push_back(partner_index[j]);
+      } else {
+        lower[j] = old_lower[j];
+        upper[j] = old_upper[j];
+      }
+    }
+    for (i_t j = linear_cols; j < old_num_cols; ++j) {
+      i_t new_j        = orig_to_new[j];
+      objective[new_j] = old_objective[j];
+      lower[new_j]     = old_lower[j];
+      upper[new_j]     = old_upper[j];
+    }
+
+    if (old_Q.n > 0) {
       std::vector<i_t> row_counts(num_cols, 0);
-      i_t nz_count = problem.Q.row_start[problem.num_cols];
-      for (i_t row = 0; row < problem.Q.n; row++) {
-        i_t q_start     = problem.Q.row_start[row];
-        i_t q_end       = problem.Q.row_start[row + 1];
-        row_counts[row] = q_end - q_start;
-        for (i_t qj = q_start; qj < q_end; qj++) {
-          i_t col = problem.Q.j[qj];
-          if (pair_index[row] != -1 && pair_index[col] != -1) {
-            assert(pair_index[row] >= problem.num_cols);
-            assert(pair_index[col] >= problem.num_cols);
-            row_counts[row]++;
-            row_counts[pair_index[row]] += 2;
-            nz_count += 3;
-          } else if (pair_index[col] != -1) {
-            assert(pair_index[col] >= problem.num_cols);
-            row_counts[row]++;
+      i_t nz_count = 0;
+      for (i_t row = 0; row < old_Q.n; ++row) {
+        i_t new_row     = orig_to_new[row];
+        i_t partner_row = partner_index[row];
+        i_t q_start     = old_Q.row_start[row];
+        i_t q_end       = old_Q.row_start[row + 1];
+        for (i_t qj = q_start; qj < q_end; ++qj) {
+          i_t col         = old_Q.j[qj];
+          i_t partner_col = partner_index[col];
+          row_counts[new_row]++;
+          nz_count++;
+          if (partner_col != -1) {
+            row_counts[new_row]++;
             nz_count++;
-          } else if (pair_index[row] != -1) {
-            assert(pair_index[row] >= problem.num_cols);
-            row_counts[pair_index[row]]++;
+          }
+          if (partner_row != -1) {
+            row_counts[partner_row]++;
             nz_count++;
+            if (partner_col != -1) {
+              row_counts[partner_row]++;
+              nz_count++;
+            }
           }
         }
       }
 
       std::vector<i_t> Q_row_start(num_cols + 1);
       Q_row_start[0] = 0;
-      for (i_t row = 0; row < num_cols; row++) {
+      for (i_t row = 0; row < num_cols; ++row) {
         Q_row_start[row + 1] = Q_row_start[row] + row_counts[row];
       }
       std::vector<i_t> Q_j(nz_count);
       std::vector<f_t> Q_x(nz_count);
       auto row_starts = Q_row_start;
-      // First copy the original Q ma
-      for (i_t row = 0; row < problem.Q.n; row++) {
-        i_t q_start = problem.Q.row_start[row];
-        i_t q_end   = problem.Q.row_start[row + 1];
-        i_t q_nz    = Q_row_start[row];
-        for (i_t qj = q_start; qj < q_end; qj++) {
-          i_t col   = problem.Q.j[qj];
-          f_t qij   = problem.Q.x[qj];
-          Q_j[q_nz] = col;
-          Q_x[q_nz] = qij;
-          q_nz++;
-        }
-        row_starts[row] = q_nz;
-      }
+      for (i_t row = 0; row < old_Q.n; ++row) {
+        i_t new_row     = orig_to_new[row];
+        i_t partner_row = partner_index[row];
+        i_t q_start     = old_Q.row_start[row];
+        i_t q_end       = old_Q.row_start[row + 1];
+        for (i_t qj = q_start; qj < q_end; ++qj) {
+          i_t col         = old_Q.j[qj];
+          f_t qij         = old_Q.x[qj];
+          i_t new_col     = orig_to_new[col];
+          i_t partner_col = partner_index[col];
 
-      // Expand the Q matrix for the free variables
-      for (i_t row = 0; row < problem.Q.n; row++) {
-        i_t q_start = problem.Q.row_start[row];
-        i_t q_end   = problem.Q.row_start[row + 1];
-        for (i_t qj = q_start; qj < q_end; qj++) {
-          i_t col = problem.Q.j[qj];
-          f_t qij = problem.Q.x[qj];
-          if (pair_index[row] != -1 && pair_index[col] != -1) {
-            Q_j[row_starts[row]] = pair_index[col];
-            Q_x[row_starts[row]] = -qij;
-            row_starts[row]++;
+          Q_j[row_starts[new_row]] = new_col;
+          Q_x[row_starts[new_row]] = qij;
+          row_starts[new_row]++;
 
-            Q_j[row_starts[pair_index[row]]] = col;
-            Q_x[row_starts[pair_index[row]]] = -qij;
-            row_starts[pair_index[row]]++;
-
-            Q_j[row_starts[pair_index[row]]] = pair_index[col];
-            Q_x[row_starts[pair_index[row]]] = qij;
-            row_starts[pair_index[row]]++;
-          } else if (pair_index[col] != -1) {
-            Q_j[row_starts[row]] = pair_index[col];
-            Q_x[row_starts[row]] = -qij;
-            row_starts[row]++;
-          } else if (pair_index[row] != -1) {
-            Q_j[row_starts[pair_index[row]]] = col;
-            Q_x[row_starts[pair_index[row]]] = -qij;
-            row_starts[pair_index[row]]++;
+          if (partner_col != -1) {
+            Q_j[row_starts[new_row]] = partner_col;
+            Q_x[row_starts[new_row]] = -qij;
+            row_starts[new_row]++;
+          }
+          if (partner_row != -1) {
+            Q_j[row_starts[partner_row]] = new_col;
+            Q_x[row_starts[partner_row]] = -qij;
+            row_starts[partner_row]++;
+            if (partner_col != -1) {
+              Q_j[row_starts[partner_row]] = partner_col;
+              Q_x[row_starts[partner_row]] = qij;
+              row_starts[partner_row]++;
+            }
           }
         }
       }
@@ -1304,9 +1441,13 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
       problem.Q.check_matrix("After free variable expansion");
     }
 
-    // assert(problem.A.p[num_cols] == nnz);
-    problem.A.n      = num_cols;
-    problem.num_cols = num_cols;
+    problem.A         = expanded_A;
+    problem.A.n       = num_cols;
+    problem.objective = objective;
+    problem.lower     = lower;
+    problem.upper     = upper;
+    problem.num_cols  = num_cols;
+    if (!problem.second_order_cone_dims.empty()) { problem.cone_var_start = new_cone_start; }
   }
 
   if (settings.barrier_presolve && settings.folding != 0 && problem.Q.n == 0 &&
@@ -1388,7 +1529,7 @@ void crush_primal_solution(const user_problem_t<i_t, f_t>& user_problem,
   // including previously added slacks, are reset before writing new values.
   solution.assign(problem.num_cols, 0.0);
   for (i_t j = 0; j < user_problem.num_cols; j++) {
-    solution[j] = user_solution[j];
+    solution[user_col_to_problem_col(user_problem, problem, j)] = user_solution[j];
   }
 
   std::vector<f_t> primal_residual(problem.num_rows);
@@ -1428,7 +1569,7 @@ void crush_primal_solution_with_slack(const user_problem_t<i_t, f_t>& user_probl
   // Re-crush can be called with a reused output vector; clear stale entries first.
   solution.assign(problem.num_cols, 0.0);
   for (i_t j = 0; j < user_problem.num_cols; j++) {
-    solution[j] = user_solution[j];
+    solution[user_col_to_problem_col(user_problem, problem, j)] = user_solution[j];
   }
 
   std::vector<f_t> primal_residual(problem.num_rows);
@@ -1475,9 +1616,9 @@ f_t crush_dual_solution(const user_problem_t<i_t, f_t>& user_problem,
   for (i_t i = 0; i < user_problem.num_rows; i++) {
     y[i] = user_y[i];
   }
-  z.resize(problem.num_cols);
+  z.assign(problem.num_cols, 0.0);
   for (i_t j = 0; j < user_problem.num_cols; j++) {
-    z[j] = user_z[j];
+    z[user_col_to_problem_col(user_problem, problem, j)] = user_z[j];
   }
 
   std::vector<bool> is_range_row(problem.num_rows, false);
@@ -1545,6 +1686,17 @@ f_t crush_dual_solution(const user_problem_t<i_t, f_t>& user_problem,
 }
 
 template <typename i_t, typename f_t>
+static i_t user_col_to_problem_col(const user_problem_t<i_t, f_t>& user_problem,
+                                   const lp_problem_t<i_t, f_t>& problem,
+                                   i_t user_col)
+{
+  if (user_problem.second_order_cone_dims.empty()) { return user_col; }
+  if (problem.cone_var_start <= user_problem.cone_var_start) { return user_col; }
+  if (user_col < user_problem.cone_var_start) { return user_col; }
+  return problem.cone_var_start + (user_col - user_problem.cone_var_start);
+}
+
+template <typename i_t, typename f_t>
 void uncrush_primal_solution(const user_problem_t<i_t, f_t>& user_problem,
                              const lp_problem_t<i_t, f_t>& problem,
                              const std::vector<f_t>& solution,
@@ -1553,9 +1705,9 @@ void uncrush_primal_solution(const user_problem_t<i_t, f_t>& user_problem,
   user_solution.resize(user_problem.num_cols);
   assert(problem.num_cols >= user_problem.num_cols);
   assert(solution.size() >= user_problem.num_cols);
-  std::copy(solution.begin(),
-            solution.begin() + std::min((i_t)solution.size(), user_problem.num_cols),
-            user_solution.data());
+  for (i_t j = 0; j < user_problem.num_cols; ++j) {
+    user_solution[j] = solution[user_col_to_problem_col(user_problem, problem, j)];
+  }
 }
 
 template <typename i_t, typename f_t>
@@ -1658,13 +1810,25 @@ void uncrush_solution(const presolve_info_t<i_t, f_t>& presolve_info,
   if (num_free_variables > 0) {
     settings.log.printf("Post-solve: Handling free variables %d\n", num_free_variables);
     // We added free variables so we need to map the crushed solution back to the original variables
+    std::vector<bool> remove_partner(input_x.size(), false);
     for (i_t k = 0; k < 2 * num_free_variables; k += 2) {
       const i_t u = free_variable_pairs[k];
       const i_t v = free_variable_pairs[k + 1];
       input_x[u] -= input_x[v];
+      remove_partner[v] = true;
     }
-    input_z.resize(input_z.size() - num_free_variables);
-    input_x.resize(input_x.size() - num_free_variables);
+    std::vector<f_t> compact_x;
+    std::vector<f_t> compact_z;
+    compact_x.reserve(input_x.size() - num_free_variables);
+    compact_z.reserve(input_z.size() - num_free_variables);
+    for (i_t j = 0; j < static_cast<i_t>(input_x.size()); ++j) {
+      if (!remove_partner[j]) {
+        compact_x.push_back(input_x[j]);
+        compact_z.push_back(input_z[j]);
+      }
+    }
+    input_x = compact_x;
+    input_z = compact_z;
   }
 
   if (presolve_info.removed_variables.size() > 0) {

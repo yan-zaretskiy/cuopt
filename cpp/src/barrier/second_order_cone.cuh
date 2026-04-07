@@ -15,814 +15,319 @@
 #include <raft/core/device_span.hpp>
 #include <raft/util/cudart_utils.hpp>
 
-#include <cuda/std/tuple>
-
-#include <cub/block/block_reduce.cuh>
+#include <cub/device/device_segmented_reduce.cuh>
 
 #include <rmm/exec_policy.hpp>
 
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
-#include <thrust/scatter.h>
 #include <algorithm>
+#include <cstdint>
 #include <numeric>
-#include <type_traits>
 #include <vector>
 
 namespace cuopt::linear_programming::dual_simplex {
 
 // ---------------------------------------------------------------------------
-// Shared reduction primitives
+// Flat cone kernels: segmented reductions compute per-cone scalars, then a
+// single elementwise launch applies the result across all packed cone entries.
+// This keeps the cone math vectorized instead of one block per cone.
 // ---------------------------------------------------------------------------
 
-template <typename f_t>
-using triplet_t = cuda::std::tuple<f_t, f_t, f_t>;
+constexpr int flat_block_dim = 256;
+
+template <typename i_t, typename f_t>
+__global__ void apply_hinv2_write_kernel(raft::device_span<const f_t> v,
+                                         raft::device_span<f_t> out,
+                                         raft::device_span<const f_t> w_bar,
+                                         raft::device_span<const f_t> inv_eta,
+                                         raft::device_span<const f_t> tail_dot,
+                                         raft::device_span<const i_t> cone_offsets,
+                                         raft::device_span<const i_t> element_cone_ids,
+                                         f_t output_scale)
+{
+  i_t flat_idx = static_cast<i_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (flat_idx >= static_cast<i_t>(out.size())) return;
+
+  i_t cone      = element_cone_ids[flat_idx];
+  i_t cone_off  = cone_offsets[cone];
+  i_t local_idx = flat_idx - cone_off;
+
+  f_t ie_sq     = inv_eta[cone] * inv_eta[cone];
+  f_t u_tv      = w_bar[cone_off] * v[cone_off] - tail_dot[cone];
+  f_t coeff     = f_t(2) * u_tv * ie_sq;
+  int sign      = (local_idx == 0) * 2 - 1;
+  f_t value     = coeff * w_bar[flat_idx] - ie_sq * v[flat_idx];
+  out[flat_idx] = output_scale * value * sign;
+}
 
 template <typename f_t>
-struct triplet_sum {
-  DI triplet_t<f_t> operator()(const triplet_t<f_t>& lhs, const triplet_t<f_t>& rhs) const
+struct corrector_raw_t {
+  f_t zeta;
+  f_t xi;
+  f_t psi;
+};
+
+template <typename f_t>
+struct corrector_raw_sum_t {
+  HD corrector_raw_t<f_t> operator()(const corrector_raw_t<f_t>& lhs,
+                                     const corrector_raw_t<f_t>& rhs) const
   {
-    const auto& [v0_l, v1_l, v2_l] = lhs;
-    const auto& [v0_r, v1_r, v2_r] = rhs;
-    return {v0_l + v0_r, v1_l + v1_r, v2_l + v2_r};
+    return {lhs.zeta + rhs.zeta, lhs.xi + rhs.xi, lhs.psi + rhs.psi};
   }
 };
 
-template <typename T, int BLOCK_DIM>
-using block_reduce_t = cub::BlockReduce<T, BLOCK_DIM, cub::BLOCK_REDUCE_RAKING_COMMUTATIVE_ONLY>;
+template <typename i_t, typename f_t>
+struct cone_scratch_t {
+  i_t K;
+  rmm::device_uvector<corrector_raw_t<f_t>> corrector_raw;  // [K] {zeta, xi, psi}
+  rmm::device_uvector<f_t> scalar_slots;  // [6 * K] reusable K-length scalar scratch slots
+  rmm::device_uvector<f_t> step_alpha_primal;
+  rmm::device_uvector<f_t> step_alpha_dual;
+  rmm::device_uvector<std::uint8_t> segmented_reduce_workspace;
 
-template <typename f_t, int BLOCK_DIM>
-struct smem_reduce_t {
-  using ScalarReduce  = block_reduce_t<f_t, BLOCK_DIM>;
-  using TripletReduce = block_reduce_t<triplet_t<f_t>, BLOCK_DIM>;
+  cone_scratch_t(i_t K_in, rmm::cuda_stream_view stream)
+    : K(K_in),
+      corrector_raw(K_in, stream),
+      scalar_slots(6 * K_in, stream),
+      step_alpha_primal(K_in, stream),
+      step_alpha_dual(K_in, stream),
+      segmented_reduce_workspace(0, stream)
+  {
+  }
 
-  union {
-    typename ScalarReduce::TempStorage scalar_temp;
-    typename TripletReduce::TempStorage triplet_temp;
-    f_t scalar_broadcast;
-    triplet_t<f_t> triplet_broadcast;
-  };
+  raft::device_span<f_t> hinv2_tail_dot() { return slot_span(0); }
+  raft::device_span<f_t> step_s_du1_sq() { return slot_span(0); }
+  raft::device_span<f_t> step_s_u1du1() { return slot_span(1); }
+  raft::device_span<f_t> step_s_u1_sq() { return slot_span(2); }
+  raft::device_span<f_t> step_l_du1_sq() { return slot_span(3); }
+  raft::device_span<f_t> step_l_u1du1() { return slot_span(4); }
+  raft::device_span<f_t> step_l_u1_sq() { return slot_span(5); }
+
+  raft::device_span<f_t> nt_s1_sq() { return slot_span(0); }
+  raft::device_span<f_t> nt_l1_sq() { return slot_span(1); }
+  raft::device_span<f_t> nt_sl() { return slot_span(2); }
+
+  raft::device_span<f_t> step_alpha_primal_span() { return cuopt::make_span(step_alpha_primal); }
+  raft::device_span<f_t> step_alpha_dual_span() { return cuopt::make_span(step_alpha_dual); }
+
+ private:
+  raft::device_span<f_t> slot_span(i_t slot)
+  {
+    return raft::device_span<f_t>(scalar_slots.data() + slot * K, K);
+  }
 };
 
-// ---------------------------------------------------------------------------
-// reduce_broadcast: block-reduce a value, then broadcast to all threads.
-// ---------------------------------------------------------------------------
-
-template <typename f_t, int BLOCK_DIM>
-DI f_t reduce_broadcast(f_t val, smem_reduce_t<f_t, BLOCK_DIM>& s)
+template <typename i_t, typename f_t>
+__global__ void fused_corrector_write_kernel(raft::device_span<const f_t> s,
+                                             raft::device_span<const f_t> lambda,
+                                             raft::device_span<const f_t> dx_aff,
+                                             raft::device_span<const f_t> omega,
+                                             raft::device_span<const f_t> w_bar,
+                                             raft::device_span<const f_t> inv_eta,
+                                             raft::device_span<const f_t> inv_1pw0,
+                                             raft::device_span<const f_t> rho,
+                                             raft::device_span<const corrector_raw_t<f_t>> raw,
+                                             raft::device_span<f_t> out,
+                                             raft::device_span<const i_t> cone_offsets,
+                                             raft::device_span<const i_t> element_cone_ids,
+                                             f_t sigma_mu,
+                                             f_t output_scale)
 {
-  f_t agg = typename smem_reduce_t<f_t, BLOCK_DIM>::ScalarReduce(s.scalar_temp).Sum(val);
-  __syncthreads();
-  if (threadIdx.x == 0) { s.scalar_broadcast = agg; }
-  __syncthreads();
-  return s.scalar_broadcast;
-}
+  i_t flat_idx = static_cast<i_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (flat_idx >= static_cast<i_t>(out.size())) return;
 
-template <typename f_t, int BLOCK_DIM>
-DI triplet_t<f_t> reduce_broadcast(triplet_t<f_t> val, smem_reduce_t<f_t, BLOCK_DIM>& s)
-{
-  auto agg = typename smem_reduce_t<f_t, BLOCK_DIM>::TripletReduce(s.triplet_temp)
-               .Reduce(val, triplet_sum<f_t>{});
-  __syncthreads();
-  if (threadIdx.x == 0) { s.triplet_broadcast = agg; }
-  __syncthreads();
-  return s.triplet_broadcast;
-}
+  i_t cone         = element_cone_ids[flat_idx];
+  i_t cone_off     = cone_offsets[cone];
+  i_t local_idx    = flat_idx - cone_off;
+  f_t ie           = inv_eta[cone];
+  f_t ipw          = inv_1pw0[cone];
+  f_t w0           = w_bar[cone_off];
+  f_t omega0       = omega[cone_off];
+  f_t dx_a0        = dx_aff[cone_off];
+  auto raw_vals    = raw[cone];
+  f_t coeff_a      = -dx_a0 + raw_vals.zeta * ipw;
+  f_t dx0          = (w0 * dx_a0 - raw_vals.zeta) * ie;
+  f_t dz0          = -omega0 - dx0;
+  f_t w_sq_sum     = max(f_t(0), w0 * w0 - f_t(1));
+  f_t w_omega_sum  = f_t(0.5) * (ie * s[cone_off] - lambda[cone_off] / ie);
+  f_t omega_sq_sum = max(f_t(0), omega0 * omega0 - rho[cone]);
+  f_t omega_dx_sum = ie * (raw_vals.xi + coeff_a * w_omega_sum);
+  f_t dx_sq_sum =
+    ie * ie * (raw_vals.psi + f_t(2) * coeff_a * raw_vals.zeta + coeff_a * coeff_a * w_sq_sum);
+  f_t r_K_0 = (omega0 * omega0 + omega_sq_sum) + (dx0 * dz0 - omega_dx_sum - dx_sq_sum) - sigma_mu;
+  f_t nu    = (f_t(2) * omega0 - dx0) * omega_sq_sum - (omega0 + f_t(2) * dx0) * omega_dx_sum;
+  f_t inv_rho    = f_t(1) / rho[cone];
+  f_t corr0      = (omega0 * r_K_0 - nu) * inv_rho;
+  f_t inv_omega0 = f_t(1) / omega0;
+  f_t c_inv      = (nu * inv_omega0 - r_K_0) * inv_rho;
+  f_t p1         = c_inv + f_t(2) - dx0 * inv_omega0;
+  f_t p2         = -(f_t(1) + f_t(2) * dx0 * inv_omega0);
+  f_t w_dx_sum   = ie * (raw_vals.zeta + coeff_a * w_sq_sum);
+  f_t zeta2      = p1 * w_omega_sum + p2 * w_dx_sum;
+  f_t coeff_c    = -corr0 + zeta2 * ipw;
 
-template <typename f_t, int BLOCK_DIM>
-struct smem_warp_reduce_t {
-  static constexpr int warps_per_block = BLOCK_DIM / 32;
+  if (local_idx == 0) {
+    out[flat_idx] = output_scale * ((w0 * corr0 - zeta2) * ie);
+    return;
+  }
 
-  using ScalarReduce  = cub::WarpReduce<f_t, 32>;
-  using TripletReduce = cub::WarpReduce<triplet_t<f_t>, 32>;
-
-  union {
-    typename ScalarReduce::TempStorage scalar_temp[warps_per_block];
-    typename TripletReduce::TempStorage triplet_temp[warps_per_block];
-    f_t scalar_broadcast[warps_per_block];
-    triplet_t<f_t> triplet_broadcast[warps_per_block];
-  };
-};
-
-// ---------------------------------------------------------------------------
-// reduce_broadcast: warp-reduce a value, then broadcast within the warp.
-// ---------------------------------------------------------------------------
-
-template <typename f_t, int BLOCK_DIM>
-DI f_t reduce_broadcast(f_t val, smem_warp_reduce_t<f_t, BLOCK_DIM>& s)
-{
-  static_assert(BLOCK_DIM % 32 == 0, "Warp reduce requires warp-aligned CTAs");
-
-  int warp = threadIdx.x >> 5;
-  int lane = threadIdx.x & 31;
-  f_t agg = typename smem_warp_reduce_t<f_t, BLOCK_DIM>::ScalarReduce(s.scalar_temp[warp]).Sum(val);
-  if (lane == 0) { s.scalar_broadcast[warp] = agg; }
-  __syncwarp();
-  return s.scalar_broadcast[warp];
-}
-
-template <typename f_t, int BLOCK_DIM>
-DI triplet_t<f_t> reduce_broadcast(triplet_t<f_t> val, smem_warp_reduce_t<f_t, BLOCK_DIM>& s)
-{
-  static_assert(BLOCK_DIM % 32 == 0, "Warp reduce requires warp-aligned CTAs");
-
-  int warp = threadIdx.x >> 5;
-  int lane = threadIdx.x & 31;
-  auto agg = typename smem_warp_reduce_t<f_t, BLOCK_DIM>::TripletReduce(s.triplet_temp[warp])
-               .Reduce(val, triplet_sum<f_t>{});
-  if (lane == 0) { s.triplet_broadcast[warp] = agg; }
-  __syncwarp();
-  return s.triplet_broadcast[warp];
+  f_t dx_j      = (dx_aff[flat_idx] + coeff_a * w_bar[flat_idx]) * ie;
+  f_t corr_j    = p1 * omega[flat_idx] + p2 * dx_j;
+  out[flat_idx] = output_scale * ((corr_j + coeff_c * w_bar[flat_idx]) * ie);
 }
 
 // ---------------------------------------------------------------------------
-// Apply H^{-1} to one vector per cone (one thread-block per cone).
-//
-// H^{-1}z = (1/η)(w̄₀z₀ − ζ,  z₁ + (−z₀ + ζ/(1+w̄₀))w̄₁),  ζ = w̄₁ᵀz₁
+// Flattened NT scaling / step-length kernels.
+// All follow the same pattern: segmented reduction to per-cone scalars, then
+// flat or scalar kernels to write the packed cone outputs.
 // ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void apply_Hinv_kernel(
-  raft::device_span<const f_t> z,
-  raft::device_span<f_t> out,
-  raft::device_span<const f_t> w_bar,
-  raft::device_span<const f_t> inv_eta,
-  raft::device_span<const f_t> inv_1pw0,
-  raft::device_span<const i_t> cone_offsets,
-  i_t K)
-{
-  __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
 
-  i_t cone = static_cast<i_t>(blockIdx.x);
+template <typename i_t, typename f_t>
+__global__ void nt_scaling_scalar_kernel(raft::device_span<const f_t> s,
+                                         raft::device_span<const f_t> lambda,
+                                         raft::device_span<const i_t> cone_offsets,
+                                         raft::device_span<const f_t> s1_sq,
+                                         raft::device_span<const f_t> l1_sq,
+                                         raft::device_span<const f_t> sl,
+                                         raft::device_span<f_t> inv_eta,
+                                         raft::device_span<f_t> inv_1pw0,
+                                         raft::device_span<f_t> w_bar,
+                                         raft::device_span<f_t> omega,
+                                         raft::device_span<f_t> rho,
+                                         i_t K)
+{
+  i_t cone = static_cast<i_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (cone >= K) return;
 
-  i_t off       = cone_offsets[cone];
-  i_t q         = cone_offsets[cone + 1] - off;
-  auto w_cone   = w_bar.subspan(off, q);
-  auto z_cone   = z.subspan(off, q);
-  auto out_cone = out.subspan(off, q);
+  i_t off = cone_offsets[cone];
+  f_t s0  = s[off];
+  f_t l0  = lambda[off];
 
-  f_t z0 = z_cone[0];
-  f_t w0 = w_cone[0];
+  f_t s_J       = sqrt(max(f_t(0), s0 * s0 - s1_sq[cone]));
+  f_t l_J       = sqrt(max(f_t(0), l0 * l0 - l1_sq[cone]));
+  f_t inv_s_J   = f_t(1) / s_J;
+  f_t inv_l_J   = f_t(1) / l_J;
+  f_t rho_val   = s_J * l_J;
+  f_t inv_eta_v = sqrt(l_J / s_J);
+  f_t scale     = sqrt(rho_val);
 
-  // Phase 1: ζ = w̄₁ᵀ z₁
-  f_t partial = f_t(0);
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    partial += w_cone[j] * z_cone[j];
-  }
-  f_t zeta = reduce_broadcast(partial, smem);
+  f_t s_dot_l = (s0 * l0 + sl[cone]) * inv_s_J * inv_l_J;
+  f_t gamma   = sqrt(max(f_t(0), (f_t(1) + s_dot_l) * f_t(0.5)));
+  f_t inv_2g  = f_t(1) / (f_t(2) * gamma);
+  f_t sb0     = s0 * inv_s_J;
+  f_t lb0     = l0 * inv_l_J;
 
-  // Phase 2: element-wise output
-  f_t ie    = inv_eta[cone];
-  f_t ipw   = inv_1pw0[cone];
-  f_t coeff = -z0 + zeta * ipw;
-
-  if (threadIdx.x == 0) { out_cone[0] = (w0 * z0 - zeta) * ie; }
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    out_cone[j] = (z_cone[j] + coeff * w_cone[j]) * ie;
-  }
+  f_t w0         = (sb0 + lb0) * inv_2g;
+  inv_eta[cone]  = inv_eta_v;
+  inv_1pw0[cone] = f_t(1) / (f_t(1) + w0);
+  w_bar[off]     = w0;
+  omega[off]     = gamma * scale;
+  rho[cone]      = rho_val;
 }
 
-// ---------------------------------------------------------------------------
-// Apply H^{-2} to one vector per cone (one thread-block per cone).
-//
-// H^{-2}v = η⁻²(2u(uᵀv) − Jv),   u = Jw̄,   J = diag(1,−1,…,−1).
-//
-// One dot product (uᵀv) plus element-wise work — same structure as apply_Hinv.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void apply_Hinv2_kernel(
-  raft::device_span<const f_t> v,
-  raft::device_span<f_t> out,
-  raft::device_span<const f_t> w_bar,
-  raft::device_span<const f_t> inv_eta,
-  raft::device_span<const i_t> cone_offsets,
-  i_t K)
+template <typename i_t, typename f_t>
+__global__ void nt_scaling_tail_kernel(raft::device_span<const f_t> s,
+                                       raft::device_span<const f_t> lambda,
+                                       raft::device_span<const f_t> inv_eta,
+                                       raft::device_span<const f_t> rho,
+                                       raft::device_span<f_t> w_bar,
+                                       raft::device_span<f_t> omega,
+                                       raft::device_span<const i_t> cone_offsets,
+                                       raft::device_span<const i_t> element_cone_ids)
 {
-  __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
+  i_t flat_idx = static_cast<i_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (flat_idx >= static_cast<i_t>(w_bar.size())) return;
 
-  i_t cone = static_cast<i_t>(blockIdx.x);
-  if (cone >= K) return;
+  i_t cone     = element_cone_ids[flat_idx];
+  i_t cone_off = cone_offsets[cone];
+  if (flat_idx == cone_off) return;
 
-  i_t off       = cone_offsets[cone];
-  i_t q         = cone_offsets[cone + 1] - off;
-  auto w_cone   = w_bar.subspan(off, q);
-  auto v_cone   = v.subspan(off, q);
-  auto out_cone = out.subspan(off, q);
+  f_t s0          = s[cone_off];
+  f_t l0          = lambda[cone_off];
+  f_t inv_eta_val = inv_eta[cone];
+  f_t rho_val     = rho[cone];
+  f_t scale       = sqrt(rho_val);
 
-  f_t v0 = v_cone[0];
-  f_t w0 = w_cone[0];
+  f_t s_J     = scale / inv_eta_val;
+  f_t l_J     = scale * inv_eta_val;
+  f_t inv_s_J = f_t(1) / s_J;
+  f_t inv_l_J = f_t(1) / l_J;
 
-  // Phase 1: uᵀv = w̄₀v₀ − Σ w̄_j v_j  (tail dot, then subtract from head)
-  f_t partial = f_t(0);
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    partial += w_cone[j] * v_cone[j];
-  }
-  f_t tail_dot = reduce_broadcast(partial, smem);
-  f_t uTv      = w0 * v0 - tail_dot;
+  f_t gamma  = omega[cone_off] / scale;
+  f_t inv_2g = f_t(1) / (f_t(2) * gamma);
+  f_t sb0    = s0 * inv_s_J;
+  f_t lb0    = l0 * inv_l_J;
+  f_t D      = sb0 + lb0 + f_t(2) * gamma;
+  f_t inv_D  = f_t(1) / D;
+  f_t c_s    = (gamma + sb0) * inv_D;
+  f_t c_l    = (gamma + lb0) * inv_D;
 
-  // Phase 2: element-wise output
-  f_t ie_sq = inv_eta[cone] * inv_eta[cone];
-  f_t coeff = f_t(2) * uTv * ie_sq;
+  f_t w_from_s           = inv_2g * inv_s_J;
+  f_t w_from_lambda      = -inv_2g * inv_l_J;
+  f_t omega_s_coeff      = scale * c_l * inv_s_J;
+  f_t omega_lambda_coeff = scale * c_s * inv_l_J;
 
-  if (threadIdx.x == 0) { out_cone[0] = coeff * w0 - ie_sq * v0; }
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    out_cone[j] = -coeff * w_cone[j] + ie_sq * v_cone[j];
-  }
+  f_t sj          = s[flat_idx];
+  f_t lj          = lambda[flat_idx];
+  w_bar[flat_idx] = w_from_s * sj + w_from_lambda * lj;
+  omega[flat_idx] = omega_s_coeff * sj + omega_lambda_coeff * lj;
 }
-
-// ---------------------------------------------------------------------------
-// Cone-algebra primitives for the deferred combined-step corrector:
-//   r_K = omega circ omega + dx_scaled circ dz_scaled - sigma mu e
-//   corr = omega \ r_K
-//   t_K = H^{-1} corr
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Jordan product for packed SOC vectors (one CTA per cone).
-//
-// For a, b in Q^q:   (a ∘ b)_0 = a^T b,   (a ∘ b)_j = a_0 b_j + b_0 a_j.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void jordan_product_kernel(
-  raft::device_span<const f_t> a,
-  raft::device_span<const f_t> b,
-  raft::device_span<f_t> out,
-  raft::device_span<const i_t> cone_offsets,
-  i_t K)
-{
-  __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
-
-  i_t cone = static_cast<i_t>(blockIdx.x);
-  if (cone >= K) return;
-
-  i_t off       = cone_offsets[cone];
-  i_t q         = cone_offsets[cone + 1] - off;
-  auto a_cone   = a.subspan(off, q);
-  auto b_cone   = b.subspan(off, q);
-  auto out_cone = out.subspan(off, q);
-
-  f_t a0 = a_cone[0];
-  f_t b0 = b_cone[0];
-
-  f_t partial = f_t(0);
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    partial += a_cone[j] * b_cone[j];
-  }
-  f_t tail_dot = reduce_broadcast(partial, smem);
-
-  if (threadIdx.x == 0) { out_cone[0] = a0 * b0 + tail_dot; }
-
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    out_cone[j] = a0 * b_cone[j] + b0 * a_cone[j];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Inverse Jordan product for packed SOC vectors (one CTA per cone).
-//
-// For omega in int(Q^q) and vector r,
-//   (omega \ r)_0 = (omega_0 r_0 − nu) / rho
-//   (omega \ r)_j = ((nu/omega_0 − r_0)/rho) omega_j + r_j/omega_0
-// where nu = omega_1^T r_1 and rho = ||omega||_J^2 (stored per-cone).
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void inverse_jordan_product_kernel(
-  raft::device_span<const f_t> omega,
-  raft::device_span<const f_t> r,
-  raft::device_span<const f_t> rho,
-  raft::device_span<f_t> out,
-  raft::device_span<const i_t> cone_offsets,
-  i_t K)
-{
-  __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
-
-  i_t cone = static_cast<i_t>(blockIdx.x);
-  if (cone >= K) return;
-
-  i_t off         = cone_offsets[cone];
-  i_t q           = cone_offsets[cone + 1] - off;
-  auto omega_cone = omega.subspan(off, q);
-  auto r_cone     = r.subspan(off, q);
-  auto out_cone   = out.subspan(off, q);
-
-  f_t omega_0 = omega_cone[0];
-  f_t r_0     = r_cone[0];
-
-  f_t partial = f_t(0);
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    partial += omega_cone[j] * r_cone[j];
-  }
-  f_t nu = reduce_broadcast(partial, smem);
-
-  f_t rho_val   = rho[cone];
-  f_t inv_rho   = f_t(1) / rho_val;
-  f_t c_omega_j = ((nu / omega_0) - r_0) * inv_rho;
-  f_t c_r_j     = f_t(1) / omega_0;
-
-  if (threadIdx.x == 0) { out_cone[0] = (omega_0 * r_0 - nu) * inv_rho; }
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    out_cone[j] = c_omega_j * omega_cone[j] + c_r_j * r_cone[j];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Fused corrector for the combined-step SOC correction (one CTA per cone).
-//
-// Computes in a single kernel launch:
-//   1. dx  = H^{-1} Δx_aff                      (affine scaled direction)
-//   2. dz  = −ω − dx                             (complementary direction)
-//   3. r_K = ω∘ω + dx∘dz − σμ e                  (combined cone residual)
-//   4. corr = ω \ r_K                            (inverse Jordan product)
-//   5. t_K = H^{-1} corr                         (corrector for reduced RHS)
-//
-// Uses the `out` buffer as scratch (holds dx during phases 1–3) and writes
-// the final t_K there, so zero extra temporary buffers are needed.
-//
-// Algebraic shortcut:  the triplet (Σ ω_j², Σ ω_j dx_j, Σ dx_j²) computed
-// for r_K_0 also yields ν = Σ ω_j r_K_j via a linear combination, avoiding
-// a fourth reduction pass.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void fused_corrector_kernel(
-  raft::device_span<const f_t> dx_aff,
-  raft::device_span<const f_t> omega,
-  raft::device_span<const f_t> w_bar,
-  raft::device_span<const f_t> inv_eta,
-  raft::device_span<const f_t> inv_1pw0,
-  raft::device_span<const f_t> rho,
-  f_t sigma_mu,
-  raft::device_span<f_t> out,
-  raft::device_span<const i_t> cone_offsets,
-  i_t K)
-{
-  __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
-
-  i_t cone = static_cast<i_t>(blockIdx.x);
-  if (cone >= K) return;
-
-  i_t off         = cone_offsets[cone];
-  i_t q           = cone_offsets[cone + 1] - off;
-  auto dx_a       = dx_aff.subspan(off, q);
-  auto omega_cone = omega.subspan(off, q);
-  auto w_cone     = w_bar.subspan(off, q);
-  auto out_cone   = out.subspan(off, q);
-
-  f_t ie      = inv_eta[cone];
-  f_t ipw     = inv_1pw0[cone];
-  f_t rho_val = rho[cone];
-  f_t omega_0 = omega_cone[0];
-  f_t w_0     = w_cone[0];
-  f_t dx_a_0  = dx_a[0];
-
-  // =================================================================
-  // Phase A — reduce ζ = Σ_{j≥1} w̄_j (Δx_aff)_j  for H^{-1}
-  // =================================================================
-  f_t partial = f_t(0);
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    partial += w_cone[j] * dx_a[j];
-  }
-  f_t zeta = reduce_broadcast(partial, smem);
-
-  f_t dx_0    = (w_0 * dx_a_0 - zeta) * ie;
-  f_t coeff_a = -dx_a_0 + zeta * ipw;
-  f_t dz_0    = -omega_0 - dx_0;
-
-  // =================================================================
-  // Phase A→B — write dx to out; accumulate (A, B, C) for r_K and ν
-  //   A = Σ ω_j²,  B = Σ ω_j dx_j,  C = Σ dx_j²   (j ≥ 1)
-  // =================================================================
-  auto trip             = triplet_t<f_t>{};
-  auto& [A_p, B_p, C_p] = trip;
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    f_t dx_j    = (dx_a[j] + coeff_a * w_cone[j]) * ie;
-    out_cone[j] = dx_j;
-    f_t omega_j = omega_cone[j];
-    A_p += omega_j * omega_j;
-    B_p += omega_j * dx_j;
-    C_p += dx_j * dx_j;
-  }
-  auto [A, B, C] = reduce_broadcast(trip, smem);
-
-  // =================================================================
-  // Phase B — form r_K_0, derive ν, then inverse-Jordan scalars
-  // =================================================================
-  f_t r_K_0 = (omega_0 * omega_0 + A) + (dx_0 * dz_0 - B - C) - sigma_mu;
-  f_t nu    = (f_t(2) * omega_0 - dx_0) * A - (omega_0 + f_t(2) * dx_0) * B;
-
-  f_t inv_rho     = f_t(1) / rho_val;
-  f_t corr_0      = (omega_0 * r_K_0 - nu) * inv_rho;
-  f_t inv_omega_0 = f_t(1) / omega_0;
-  f_t c_inv       = (nu * inv_omega_0 - r_K_0) * inv_rho;
-  f_t p1          = c_inv + f_t(2) - dx_0 * inv_omega_0;
-  f_t p2          = -(f_t(1) + f_t(2) * dx_0 * inv_omega_0);
-
-  // =================================================================
-  // Phase B→C — accumulate ζ₂ = Σ_{j≥1} w̄_j corr_j  for final H^{-1}
-  //   corr_j = p1 ω_j + p2 dx_j   (dx_j still in out_cone[j])
-  // =================================================================
-  f_t partial2 = f_t(0);
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    f_t corr_j = p1 * omega_cone[j] + p2 * out_cone[j];
-    partial2 += w_cone[j] * corr_j;
-  }
-  f_t zeta2 = reduce_broadcast(partial2, smem);
-
-  // =================================================================
-  // Phase C — write t_K = H^{-1}(corr)
-  // =================================================================
-  f_t coeff_c = -corr_0 + zeta2 * ipw;
-
-  if (threadIdx.x == 0) { out_cone[0] = (w_0 * corr_0 - zeta2) * ie; }
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    f_t corr_j  = p1 * omega_cone[j] + p2 * out_cone[j];
-    out_cone[j] = (corr_j + coeff_c * w_cone[j]) * ie;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Compute NT scaling from (s, lambda).
-//
-// Medium/large cones use one CTA per cone and stream s/lambda twice:
-//   Pass 1: reduce ||s_1||^2, ||lambda_1||^2, and s^T lambda.
-//   Pass 2: compute omega/w_bar directly from raw inputs and reduce ||w_bar_1||^2.
-//
-// Small cones (q <= 32) use one warp per cone and keep one element per lane in
-// registers for the whole computation. In both paths, shared memory only stores
-// per-warp partial reductions plus a small scalar broadcast struct.
-// ---------------------------------------------------------------------------
-
-constexpr int small_cone_limit  = 32;
-constexpr int medium_cone_limit = 2048;
-constexpr int small_block_dim   = 64;
-constexpr int medium_block_dim  = 128;
-constexpr int large_block_dim   = 256;
 
 template <typename f_t>
-struct nt_broadcast_coeffs {
-  f_t w_from_s;
-  f_t w_from_lambda;
-  f_t omega_s_coeff;
-  f_t omega_lambda_coeff;
-};
-
-template <typename f_t, int BLOCK_DIM>
-struct nt_block_storage {
-  smem_reduce_t<f_t, BLOCK_DIM> reduce;
-  nt_broadcast_coeffs<f_t> coeffs;
-};
-
-template <typename f_t, int BLOCK_DIM>
-struct nt_warp_storage {
-  static constexpr int warps_per_block = BLOCK_DIM / 32;
-
-  smem_warp_reduce_t<f_t, BLOCK_DIM> reduce;
-  nt_broadcast_coeffs<f_t> coeffs[warps_per_block];
-};
-
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void nt_scaling_kernel(
-  raft::device_span<const f_t> s,
-  raft::device_span<const f_t> lambda,
-  raft::device_span<f_t> eta,
-  raft::device_span<f_t> inv_eta,
-  raft::device_span<f_t> inv_1pw0,
-  raft::device_span<f_t> w_bar,
-  raft::device_span<f_t> omega,
-  raft::device_span<f_t> rho,
-  raft::device_span<const i_t> cone_offsets,
-  raft::device_span<const i_t> cone_ids,
-  i_t num_cones)
+DI f_t cone_step_length_from_scalars(f_t u0, f_t du0, f_t du1_sq, f_t u1du1, f_t c, f_t alpha_max)
 {
-  static_assert(BLOCK_DIM % 32 == 0, "NT scaling kernel requires warp-aligned BLOCK_DIM");
-  __shared__ nt_block_storage<f_t, BLOCK_DIM> storage;
+  f_t a     = du0 * du0 - du1_sq;
+  f_t b     = u0 * du0 - u1du1;
+  f_t disc  = b * b - a * c;
+  f_t alpha = alpha_max;
 
-  i_t cone_idx = static_cast<i_t>(blockIdx.x);
-  if (cone_idx >= num_cones) return;
-
-  i_t cone = cone_ids[cone_idx];
-  i_t off  = cone_offsets[cone];
-  i_t q    = cone_offsets[cone + 1] - off;
-
-  f_t s0 = s[off];
-  f_t l0 = lambda[off];
-
-  auto partial                   = triplet_t<f_t>{};
-  auto& [s1_sq_p, l1_sq_p, sl_p] = partial;
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    f_t sj = s[off + j];
-    f_t lj = lambda[off + j];
-    s1_sq_p += sj * sj;
-    l1_sq_p += lj * lj;
-    sl_p += sj * lj;
-  }
-
-  auto [s1_sq, l1_sq, sl] = reduce_broadcast(partial, storage.reduce);
-  f_t owner_eta           = f_t(0);
-  f_t owner_inv_eta       = f_t(0);
-  f_t owner_rho           = f_t(0);
-  f_t owner_omega_0       = f_t(0);
-  if (threadIdx.x == 0) {
-    // Clamp radicands to zero: near the cone boundary, roundoff can make these
-    // slightly negative.
-    f_t s_J       = sqrt(max(f_t(0), s0 * s0 - s1_sq));
-    f_t l_J       = sqrt(max(f_t(0), l0 * l0 - l1_sq));
-    f_t inv_s_J   = f_t(1) / s_J;
-    f_t inv_l_J   = f_t(1) / l_J;
-    owner_rho     = s_J * l_J;
-    owner_eta     = sqrt(s_J / l_J);
-    owner_inv_eta = f_t(1) / owner_eta;
-    f_t scale     = sqrt(owner_rho);
-
-    f_t s_dot_l = (s0 * l0 + sl) * inv_s_J * inv_l_J;
-    f_t gamma   = sqrt(max(f_t(0), (f_t(1) + s_dot_l) * f_t(0.5)));
-    f_t inv_2g  = f_t(1) / (f_t(2) * gamma);
-    f_t sb0     = s0 * inv_s_J;
-    f_t lb0     = l0 * inv_l_J;
-    f_t D       = sb0 + lb0 + f_t(2) * gamma;
-    f_t inv_D   = f_t(1) / D;
-    f_t c_s     = (gamma + sb0) * inv_D;
-    f_t c_l     = (gamma + lb0) * inv_D;
-
-    storage.coeffs.w_from_s      = inv_2g * inv_s_J;
-    storage.coeffs.w_from_lambda = -inv_2g * inv_l_J;
-    // Name these by the raw tail element they multiply:
-    // omega_j = omega_s_coeff * s_j + omega_lambda_coeff * lambda_j.
-    // The closed-form NT expression is cross-coupled, so c_l multiplies s_j
-    // and c_s multiplies lambda_j.
-    storage.coeffs.omega_s_coeff      = scale * c_l * inv_s_J;
-    storage.coeffs.omega_lambda_coeff = scale * c_s * inv_l_J;
-    owner_omega_0                     = gamma * scale;
-  }
-  __syncthreads();
-
-  f_t w1_sq_partial = f_t(0);
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    f_t sj         = s[off + j];
-    f_t lj         = lambda[off + j];
-    f_t wj         = storage.coeffs.w_from_s * sj + storage.coeffs.w_from_lambda * lj;
-    w_bar[off + j] = wj;
-    omega[off + j] = storage.coeffs.omega_s_coeff * sj + storage.coeffs.omega_lambda_coeff * lj;
-    w1_sq_partial += wj * wj;
-  }
-
-  f_t w1_sq = reduce_broadcast(w1_sq_partial, storage.reduce);
-  if (threadIdx.x == 0) {
-    f_t w0         = sqrt(f_t(1) + w1_sq);
-    omega[off]     = owner_omega_0;
-    w_bar[off]     = w0;
-    eta[cone]      = owner_eta;
-    inv_eta[cone]  = owner_inv_eta;
-    inv_1pw0[cone] = f_t(1) / (f_t(1) + w0);
-    rho[cone]      = owner_rho;
-  }
-}
-
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void nt_scaling_small_kernel(
-  raft::device_span<const f_t> s,
-  raft::device_span<const f_t> lambda,
-  raft::device_span<f_t> eta,
-  raft::device_span<f_t> inv_eta,
-  raft::device_span<f_t> inv_1pw0,
-  raft::device_span<f_t> w_bar,
-  raft::device_span<f_t> omega,
-  raft::device_span<f_t> rho,
-  raft::device_span<const i_t> cone_offsets,
-  raft::device_span<const i_t> cone_ids,
-  i_t num_cones)
-{
-  static_assert(BLOCK_DIM % 32 == 0, "Small-cone NT kernel requires warp-aligned CTAs");
-  __shared__ nt_warp_storage<f_t, BLOCK_DIM> storage;
-
-  constexpr int warps_per_block = BLOCK_DIM / 32;
-  i_t warp_idx =
-    static_cast<i_t>(blockIdx.x) * warps_per_block + static_cast<i_t>(threadIdx.x >> 5);
-  if (warp_idx >= num_cones) return;
-
-  int warp = threadIdx.x >> 5;
-  int lane = threadIdx.x & 31;
-  i_t cone = cone_ids[warp_idx];
-  i_t off  = cone_offsets[cone];
-  i_t q    = cone_offsets[cone + 1] - off;
-
-  f_t sj = (lane < q) ? s[off + lane] : f_t(0);
-  f_t lj = (lane < q) ? lambda[off + lane] : f_t(0);
-
-  auto partial = triplet_t<f_t>{(lane > 0 && lane < q) ? sj * sj : f_t(0),
-                                (lane > 0 && lane < q) ? lj * lj : f_t(0),
-                                (lane > 0 && lane < q) ? sj * lj : f_t(0)};
-  auto [s1_sq, l1_sq, sl] = reduce_broadcast(partial, storage.reduce);
-
-  f_t owner_eta     = f_t(0);
-  f_t owner_inv_eta = f_t(0);
-  f_t owner_rho     = f_t(0);
-  f_t owner_omega_0 = f_t(0);
-
-  if (lane == 0) {
-    f_t s0        = sj;
-    f_t l0        = lj;
-    f_t s_J       = sqrt(max(f_t(0), s0 * s0 - s1_sq));
-    f_t l_J       = sqrt(max(f_t(0), l0 * l0 - l1_sq));
-    f_t inv_s_J   = f_t(1) / s_J;
-    f_t inv_l_J   = f_t(1) / l_J;
-    owner_rho     = s_J * l_J;
-    owner_eta     = sqrt(s_J / l_J);
-    owner_inv_eta = f_t(1) / owner_eta;
-    f_t scale     = sqrt(owner_rho);
-
-    f_t s_dot_l = (s0 * l0 + sl) * inv_s_J * inv_l_J;
-    f_t gamma   = sqrt(max(f_t(0), (f_t(1) + s_dot_l) * f_t(0.5)));
-    f_t inv_2g  = f_t(1) / (f_t(2) * gamma);
-    f_t sb0     = s0 * inv_s_J;
-    f_t lb0     = l0 * inv_l_J;
-    f_t D       = sb0 + lb0 + f_t(2) * gamma;
-    f_t inv_D   = f_t(1) / D;
-    f_t c_s     = (gamma + sb0) * inv_D;
-    f_t c_l     = (gamma + lb0) * inv_D;
-
-    storage.coeffs[warp].w_from_s           = inv_2g * inv_s_J;
-    storage.coeffs[warp].w_from_lambda      = -inv_2g * inv_l_J;
-    storage.coeffs[warp].omega_s_coeff      = scale * c_l * inv_s_J;
-    storage.coeffs[warp].omega_lambda_coeff = scale * c_s * inv_l_J;
-    owner_omega_0                           = gamma * scale;
-  }
-  __syncwarp();
-
-  f_t w1_sq = f_t(0);
-  if (lane > 0 && lane < q) {
-    f_t wj = storage.coeffs[warp].w_from_s * sj + storage.coeffs[warp].w_from_lambda * lj;
-    w_bar[off + lane] = wj;
-    omega[off + lane] =
-      storage.coeffs[warp].omega_s_coeff * sj + storage.coeffs[warp].omega_lambda_coeff * lj;
-    w1_sq = wj * wj;
-  }
-  w1_sq = reduce_broadcast(w1_sq, storage.reduce);
-
-  if (lane == 0) {
-    f_t w0         = sqrt(f_t(1) + w1_sq);
-    omega[off]     = owner_omega_0;
-    w_bar[off]     = w0;
-    eta[cone]      = owner_eta;
-    inv_eta[cone]  = owner_inv_eta;
-    inv_1pw0[cone] = f_t(1) / (f_t(1) + w0);
-    rho[cone]      = owner_rho;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Step length for a single (u, du) pair in Q^q.
-//
-// Finds the largest alpha in [0, alpha_max] such that u + alpha*du in Q^q.
-// The cone condition u_0 + alpha*du_0 >= ||u_1 + alpha*du_1|| reduces to a
-// linear test plus a quadratic a*alpha^2 + 2b*alpha + c >= 0 where
-//   a = du_0^2 - ||du_1||^2,  b = u_0*du_0 - u_1^T du_1,  c = u_0^2 - ||u_1||^2.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-DI f_t
-cone_step_length_single(raft::device_span<const f_t> u,
-                        raft::device_span<const f_t> du,
-                        typename block_reduce_t<triplet_t<f_t>, BLOCK_DIM>::TempStorage& temp,
-                        f_t alpha)
-{
-  i_t q                              = static_cast<i_t>(u.size());
-  auto partial                       = triplet_t<f_t>{};
-  auto& [du1_sq_p, u1du1_p, u1_sq_p] = partial;
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    f_t uj  = u[j];
-    f_t duj = du[j];
-    du1_sq_p += duj * duj;
-    u1du1_p += uj * duj;
-    u1_sq_p += uj * uj;
-  }
-
-  auto [du1_sq, u1du1, u1_sq] =
-    block_reduce_t<triplet_t<f_t>, BLOCK_DIM>(temp).Reduce(partial, triplet_sum<f_t>{});
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    f_t a    = du[0] * du[0] - du1_sq;
-    f_t b    = u[0] * du[0] - u1du1;
-    f_t c    = max(f_t(0), u[0] * u[0] - u1_sq);
-    f_t disc = b * b - a * c;
-
-    // Linear constraint: u_0 + alpha * du_0 >= 0.
-    if (du[0] < f_t(0)) { alpha = min(alpha, -u[0] / du[0]); }
-
-    // Quadratic constraint.
-    if ((a > f_t(0) && b > f_t(0)) || disc < f_t(0)) {
-      // No positive root (parabola stays non-negative for alpha > 0).
-    } else if (a == f_t(0)) {
-      // Degenerate: 2b*alpha + c = 0.
-      if (b < f_t(0)) { alpha = min(alpha, c / (f_t(-2) * b)); }
-    } else if (c == f_t(0)) {
-      // Starting exactly on the cone boundary: take a full step only if the
-      // direction stays in the cone, otherwise the maximum feasible step is 0.
-      alpha = (a >= f_t(0)) ? alpha : f_t(0);
-    } else {
-      f_t t  = -(b + copysign(sqrt(disc), b));
-      f_t r1 = c / t;
-      f_t r2 = t / a;
-      if (r1 < f_t(0)) { r1 = alpha; }
-      if (r2 < f_t(0)) { r2 = alpha; }
-      alpha = min(alpha, min(r1, r2));
-    }
+  if (du0 < f_t(0)) { alpha = min(alpha, -u0 / du0); }
+  if ((a > f_t(0) && b > f_t(0)) || disc < f_t(0)) {
+    return alpha;
+  } else if (a == f_t(0)) {
+    if (b < f_t(0)) { alpha = min(alpha, c / (f_t(-2) * b)); }
+  } else if (c == f_t(0)) {
+    alpha = (a >= f_t(0)) ? alpha : f_t(0);
+  } else {
+    f_t t  = -(b + copysign(sqrt(disc), b));
+    f_t r1 = c / t;
+    f_t r2 = t / a;
+    if (r1 < f_t(0)) { r1 = alpha; }
+    if (r2 < f_t(0)) { r2 = alpha; }
+    alpha = min(alpha, min(r1, r2));
   }
   return alpha;
 }
 
-// ---------------------------------------------------------------------------
-// Cone step length kernel (one block per cone).
-//
-// Computes, for each cone i, the largest alpha in [0, alpha_max] such that
-//   s_i + alpha * ds_i  in  Q^{q_i}   AND   lambda_i + alpha * dlambda_i  in  Q^{q_i}.
-// The per-cone result is written to alpha[i].
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void step_length_kernel(
-  raft::device_span<const f_t> s,
-  raft::device_span<const f_t> ds,
-  raft::device_span<const f_t> lambda,
-  raft::device_span<const f_t> dlambda,
-  raft::device_span<f_t> alpha,
-  raft::device_span<const i_t> cone_offsets,
-  i_t K,
-  f_t alpha_max)
+template <typename i_t, typename f_t>
+__global__ void step_length_pair_kernel(raft::device_span<const f_t> s,
+                                        raft::device_span<const f_t> ds,
+                                        raft::device_span<const f_t> lambda,
+                                        raft::device_span<const f_t> dlambda,
+                                        raft::device_span<f_t> alpha_primal,
+                                        raft::device_span<f_t> alpha_dual,
+                                        raft::device_span<const f_t> s_du1_sq,
+                                        raft::device_span<const f_t> s_u1du1,
+                                        raft::device_span<const f_t> s_u1_sq,
+                                        raft::device_span<const f_t> l_du1_sq,
+                                        raft::device_span<const f_t> l_u1du1,
+                                        raft::device_span<const f_t> l_u1_sq,
+                                        raft::device_span<const i_t> cone_offsets,
+                                        f_t alpha_max,
+                                        i_t K)
 {
-  __shared__ typename block_reduce_t<triplet_t<f_t>, BLOCK_DIM>::TempStorage temp_storage;
-
-  i_t cone = static_cast<i_t>(blockIdx.x);
+  i_t cone = static_cast<i_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (cone >= K) return;
 
   i_t off = cone_offsets[cone];
-  i_t q   = cone_offsets[cone + 1] - off;
+  f_t s_c = max(f_t(0), s[off] * s[off] - s_u1_sq[cone]);
+  f_t l_c = max(f_t(0), lambda[off] * lambda[off] - l_u1_sq[cone]);
 
-  f_t alpha_s = cone_step_length_single<i_t, f_t, BLOCK_DIM>(
-    s.subspan(off, q), ds.subspan(off, q), temp_storage, alpha_max);
-  f_t alpha_l = cone_step_length_single<i_t, f_t, BLOCK_DIM>(
-    lambda.subspan(off, q), dlambda.subspan(off, q), temp_storage, alpha_max);
-
-  if (threadIdx.x == 0) { alpha[cone] = min(alpha_s, alpha_l); }
-}
-
-// ---------------------------------------------------------------------------
-// Single-variable cone step length kernel (one block per cone).
-// Like step_length_kernel but only checks u + alpha*du in Q^{q_i}.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void step_length_single_kernel(
-  raft::device_span<const f_t> u,
-  raft::device_span<const f_t> du,
-  raft::device_span<f_t> alpha,
-  raft::device_span<const i_t> cone_offsets,
-  i_t K,
-  f_t alpha_max)
-{
-  __shared__ typename block_reduce_t<triplet_t<f_t>, BLOCK_DIM>::TempStorage temp_storage;
-
-  i_t cone = static_cast<i_t>(blockIdx.x);
-  if (cone >= K) return;
-
-  i_t off = cone_offsets[cone];
-  i_t q   = cone_offsets[cone + 1] - off;
-
-  f_t a = cone_step_length_single<i_t, f_t, BLOCK_DIM>(
-    u.subspan(off, q), du.subspan(off, q), temp_storage, alpha_max);
-
-  if (threadIdx.x == 0) { alpha[cone] = a; }
-}
-
-// ---------------------------------------------------------------------------
-// Shift u into int(Q^q) if it is not already interior (one block per cone).
-//
-// alpha(u) = ||u_1|| - u_0.  If alpha >= 0 (u on boundary or outside):
-//   u_0 <- u_0 + 1 + max(0, alpha)     (shift along identity element e)
-//
-// Modifies u in place.  Used once during initial-point computation.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void interior_shift_kernel(
-  raft::device_span<f_t> u, raft::device_span<const i_t> cone_offsets, i_t K)
-{
-  __shared__ typename block_reduce_t<f_t, BLOCK_DIM>::TempStorage temp_storage;
-
-  i_t cone = static_cast<i_t>(blockIdx.x);
-  if (cone >= K) return;
-
-  i_t off = cone_offsets[cone];
-  i_t q   = cone_offsets[cone + 1] - off;
-
-  f_t tail_sq = f_t(0);
-  for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
-    f_t v = u[off + j];
-    tail_sq += v * v;
-  }
-  tail_sq = block_reduce_t<f_t, BLOCK_DIM>(temp_storage).Sum(tail_sq);
-
-  if (threadIdx.x == 0) {
-    f_t u1_norm = sqrt(tail_sq);
-    f_t gap     = u1_norm - u[off];
-    if (gap >= f_t(0)) { u[off] += f_t(1) + gap; }
-  }
+  alpha_primal[cone] = cone_step_length_from_scalars<f_t>(
+    s[off], ds[off], s_du1_sq[cone], s_u1du1[cone], s_c, alpha_max);
+  alpha_dual[cone] = cone_step_length_from_scalars<f_t>(
+    lambda[off], dlambda[off], l_du1_sq[cone], l_u1du1[cone], l_c, alpha_max);
 }
 
 /**
@@ -835,9 +340,9 @@ __global__ __launch_bounds__(BLOCK_DIM) void interior_shift_kernel(
  * caller to cover the cone portion of the global x/z vectors.  The caller
  * must keep the underlying memory alive.
  *
- * Search directions, RHS vectors, and workspace live directly in
- * iteration_data_t (matching the existing LP/QP pattern where dx_aff, dual_rhs,
- * etc. are all top-level fields of iteration_data_t).
+ * Only persistent cone state lives here. Reusable per-iteration workspace sits
+ * under `scratch`, which keeps the mutating temporary buffers out of the
+ * persistent NT state.
  */
 template <typename i_t, typename f_t>
 struct cone_data_t {
@@ -848,21 +353,21 @@ struct cone_data_t {
   rmm::device_uvector<i_t> cone_offsets;   // [K+1] prefix sums of cone_dims
   rmm::device_uvector<i_t> cone_dims;      // [K]   dimension q_i of each cone
   rmm::device_uvector<i_t> block_offsets;  // [K+1] prefix sums of q_i^2 (for dense block build)
+  rmm::device_uvector<i_t> block_entry_cone_ids;  // [sum q_i^2] owning cone id for each block entry
 
   // --- Primal/dual cone iterates (non-owning views, set by caller) ---
   raft::device_span<f_t> s;       // [m_c] cone slack: s_i in int(Q^{q_i})
   raft::device_span<f_t> lambda;  // [m_c] cone dual:  lambda_i in int(Q^{q_i})
 
   // --- NT scaling state (recomputed each iteration from s, lambda) ---
-  rmm::device_uvector<f_t> eta;  // [K]   scaling factor eta_i = (||s_i||_J / ||lambda_i||_J)^{1/2}
-  rmm::device_uvector<f_t> inv_eta;   // [K]   cached 1/eta_i
+  rmm::device_uvector<f_t>
+    inv_eta;  // [K]   1/eta_i where eta_i = (||s_i||_J / ||lambda_i||_J)^{1/2}
   rmm::device_uvector<f_t> inv_1pw0;  // [K]   cached 1/(1 + wbar_0_i)
   rmm::device_uvector<f_t> w_bar;     // [m_c] NT scaling direction, unit J-norm, packed by cone
   rmm::device_uvector<f_t> omega;  // [m_c] scaled variable omega_i = H_i^{-1} s_i, packed by cone
   rmm::device_uvector<f_t> rho;    // [K]   ||omega_i||^2_J = ||s_i||_J * ||lambda_i||_J
-  rmm::device_uvector<i_t> small_cone_ids;   // [n_small] cone ids with q <= 32
-  rmm::device_uvector<i_t> medium_cone_ids;  // [n_medium] cone ids with 32 < q <= 2048
-  rmm::device_uvector<i_t> large_cone_ids;   // [n_large] cone ids with q > 2048
+  rmm::device_uvector<i_t> element_cone_ids;  // [m_c] owning cone id for each packed entry
+  cone_scratch_t<i_t, f_t> scratch;
 
   cone_data_t(i_t K_in,
               const std::vector<i_t>& dims,
@@ -874,34 +379,31 @@ struct cone_data_t {
       cone_offsets(K_in + 1, stream),
       cone_dims(K_in, stream),
       block_offsets(K_in + 1, stream),
+      block_entry_cone_ids(
+        std::accumulate(
+          dims.begin(), dims.end(), i_t(0), [](i_t acc, i_t q) { return acc + q * q; }),
+        stream),
       s(s_in),
       lambda(lambda_in),
-      eta(K_in, stream),
       inv_eta(K_in, stream),
       inv_1pw0(K_in, stream),
       w_bar(m_c, stream),
       omega(m_c, stream),
       rho(K_in, stream),
-      small_cone_ids(0, stream),
-      medium_cone_ids(0, stream),
-      large_cone_ids(0, stream)
+      element_cone_ids(m_c, stream),
+      scratch(K_in, stream)
   {
     std::vector<i_t> offsets(K + 1, 0);
     std::vector<i_t> blk_offsets(K + 1, 0);
-    std::vector<i_t> small_ids;
-    std::vector<i_t> medium_ids;
-    std::vector<i_t> large_ids;
+    std::vector<i_t> cone_ids(m_c, 0);
+    std::vector<i_t> block_cone_ids(block_entry_cone_ids.size(), 0);
 
     for (i_t i = 0; i < K; ++i) {
       offsets[i + 1]     = offsets[i] + dims[i];
       blk_offsets[i + 1] = blk_offsets[i] + dims[i] * dims[i];
-      if (dims[i] <= small_cone_limit) {
-        small_ids.push_back(i);
-      } else if (dims[i] <= medium_cone_limit) {
-        medium_ids.push_back(i);
-      } else {
-        large_ids.push_back(i);
-      }
+      std::fill(cone_ids.begin() + offsets[i], cone_ids.begin() + offsets[i + 1], i);
+      std::fill(
+        block_cone_ids.begin() + blk_offsets[i], block_cone_ids.begin() + blk_offsets[i + 1], i);
     }
 
     auto init_device_vec = [&](auto& d_vec, const auto& h_vec) {
@@ -914,86 +416,229 @@ struct cone_data_t {
     raft::copy(cone_offsets.data(), offsets.data(), K + 1, stream);
     raft::copy(cone_dims.data(), dims.data(), K, stream);
     raft::copy(block_offsets.data(), blk_offsets.data(), K + 1, stream);
-    init_device_vec(small_cone_ids, small_ids);
-    init_device_vec(medium_cone_ids, medium_ids);
-    init_device_vec(large_cone_ids, large_ids);
+    init_device_vec(block_entry_cone_ids, block_cone_ids);
+    init_device_vec(element_cone_ids, cone_ids);
   }
 };
 
-template <typename i_t, typename f_t>
-void compute_affine_cone_rhs_term(const cone_data_t<i_t, f_t>& cones,
-                                  rmm::device_uvector<f_t>& out,
-                                  rmm::cuda_stream_view stream)
+template <typename i_t, typename f_t, typename InputIt>
+void segmented_sum(InputIt input,
+                   raft::device_span<const i_t> cone_offsets,
+                   i_t K,
+                   raft::device_span<f_t> out,
+                   rmm::device_uvector<std::uint8_t>& workspace,
+                   rmm::cuda_stream_view stream)
 {
-  out.resize(cones.m_c, stream);
+  if (K == 0) return;
+  cuopt_assert(static_cast<i_t>(out.size()) == K, "segmented_sum output must match cone count");
+
+  std::size_t temp_storage_bytes = 0;
+  cub::DeviceSegmentedReduce::Sum(nullptr,
+                                  temp_storage_bytes,
+                                  input,
+                                  out.data(),
+                                  K,
+                                  cone_offsets.data(),
+                                  cone_offsets.data() + 1,
+                                  stream.value());
+  if (workspace.size() < temp_storage_bytes) { workspace.resize(temp_storage_bytes, stream); }
+  cub::DeviceSegmentedReduce::Sum(workspace.data(),
+                                  temp_storage_bytes,
+                                  input,
+                                  out.data(),
+                                  K,
+                                  cone_offsets.data(),
+                                  cone_offsets.data() + 1,
+                                  stream.value());
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename i_t, typename t_t, typename InputIt, typename ReduceOp>
+void segmented_reduce(InputIt input,
+                      raft::device_span<const i_t> cone_offsets,
+                      i_t K,
+                      rmm::device_uvector<t_t>& out,
+                      rmm::device_uvector<std::uint8_t>& workspace,
+                      ReduceOp reduce_op,
+                      t_t initial_value,
+                      rmm::cuda_stream_view stream)
+{
+  out.resize(K, stream);
+  if (K == 0) return;
+
+  std::size_t temp_storage_bytes = 0;
+  cub::DeviceSegmentedReduce::Reduce(nullptr,
+                                     temp_storage_bytes,
+                                     input,
+                                     out.data(),
+                                     K,
+                                     cone_offsets.data(),
+                                     cone_offsets.data() + 1,
+                                     reduce_op,
+                                     initial_value,
+                                     stream.value());
+  if (workspace.size() < temp_storage_bytes) { workspace.resize(temp_storage_bytes, stream); }
+  cub::DeviceSegmentedReduce::Reduce(workspace.data(),
+                                     temp_storage_bytes,
+                                     input,
+                                     out.data(),
+                                     K,
+                                     cone_offsets.data(),
+                                     cone_offsets.data() + 1,
+                                     reduce_op,
+                                     initial_value,
+                                     stream.value());
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename i_t, typename f_t>
+void apply_hinv2(raft::device_span<const f_t> v,
+                 raft::device_span<f_t> out,
+                 raft::device_span<const f_t> w_bar,
+                 raft::device_span<const f_t> inv_eta,
+                 raft::device_span<const i_t> cone_offsets,
+                 raft::device_span<const i_t> element_cone_ids,
+                 raft::device_span<f_t> tail_dot,
+                 rmm::device_uvector<std::uint8_t>& workspace,
+                 i_t K,
+                 rmm::cuda_stream_view stream,
+                 f_t output_scale = f_t(1))
+{
+  if (K == 0) return;
+
+  auto span_v                = v;
+  auto span_w_bar            = w_bar;
+  auto span_cone_offsets     = cone_offsets;
+  auto span_element_cone_ids = element_cone_ids;
+  auto tail_terms            = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0),
+    [span_v, span_w_bar, span_cone_offsets, span_element_cone_ids] HD(i_t idx) {
+      i_t cone     = span_element_cone_ids[idx];
+      i_t cone_off = span_cone_offsets[cone];
+      return (idx == cone_off) ? f_t(0) : span_w_bar[idx] * span_v[idx];
+    });
+  segmented_sum<i_t, f_t>(tail_terms, cone_offsets, K, tail_dot, workspace, stream);
+
+  i_t grid_dim = (static_cast<i_t>(out.size()) + flat_block_dim - 1) / flat_block_dim;
+  apply_hinv2_write_kernel<i_t, f_t><<<grid_dim, flat_block_dim, 0, stream>>>(
+    v, out, w_bar, inv_eta, tail_dot, cone_offsets, element_cone_ids, output_scale);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename i_t, typename f_t>
+void apply_hinv2(raft::device_span<const f_t> v,
+                 raft::device_span<f_t> out,
+                 cone_data_t<i_t, f_t>& cones,
+                 rmm::cuda_stream_view stream,
+                 f_t output_scale = f_t(1))
+{
+  apply_hinv2<i_t, f_t>(v,
+                        out,
+                        cuopt::make_span(cones.w_bar),
+                        cuopt::make_span(cones.inv_eta),
+                        cuopt::make_span(cones.cone_offsets),
+                        cuopt::make_span(cones.element_cone_ids),
+                        cones.scratch.hinv2_tail_dot(),
+                        cones.scratch.segmented_reduce_workspace,
+                        cones.K,
+                        stream,
+                        output_scale);
+}
+
+template <typename i_t, typename f_t>
+void compute_affine_cone_rhs_term(cone_data_t<i_t, f_t>& cones,
+                                  raft::device_span<f_t> out,
+                                  rmm::cuda_stream_view stream,
+                                  f_t output_scale = f_t(1))
+{
+  cuopt_assert(static_cast<i_t>(out.size()) == cones.m_c, "cone rhs span must match cone size");
   if (cones.K == 0) return;
 
-  apply_Hinv2_kernel<i_t, f_t, medium_block_dim>
-    <<<cones.K, medium_block_dim, 0, stream>>>(cones.s,
-                                               cuopt::make_span(out),
-                                               cuopt::make_span(cones.w_bar),
-                                               cuopt::make_span(cones.inv_eta),
-                                               cuopt::make_span(cones.cone_offsets),
-                                               cones.K);
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  apply_hinv2<i_t, f_t>(cones.s, out, cones, stream, output_scale);
 }
 
 template <typename i_t, typename f_t>
 void compute_combined_cone_rhs_term(raft::device_span<const f_t> dx_aff,
-                                    const cone_data_t<i_t, f_t>& cones,
+                                    cone_data_t<i_t, f_t>& cones,
                                     f_t sigma_mu,
-                                    rmm::device_uvector<f_t>& out,
-                                    rmm::cuda_stream_view stream)
+                                    raft::device_span<f_t> out,
+                                    rmm::cuda_stream_view stream,
+                                    f_t output_scale = f_t(1))
 {
-  out.resize(cones.m_c, stream);
+  cuopt_assert(static_cast<i_t>(out.size()) == cones.m_c, "cone rhs span must match cone size");
   if (cones.K == 0) return;
 
-  fused_corrector_kernel<i_t, f_t, medium_block_dim>
-    <<<cones.K, medium_block_dim, 0, stream>>>(dx_aff,
-                                               cuopt::make_span(cones.omega),
-                                               cuopt::make_span(cones.w_bar),
-                                               cuopt::make_span(cones.inv_eta),
-                                               cuopt::make_span(cones.inv_1pw0),
-                                               cuopt::make_span(cones.rho),
-                                               sigma_mu,
-                                               cuopt::make_span(out),
-                                               cuopt::make_span(cones.cone_offsets),
-                                               cones.K);
+  auto span_dx_aff          = dx_aff;
+  auto span_w_bar           = cuopt::make_span(cones.w_bar);
+  auto span_omega           = cuopt::make_span(cones.omega);
+  auto span_cone_offsets    = cuopt::make_span(cones.cone_offsets);
+  auto span_element_cone_id = cuopt::make_span(cones.element_cone_ids);
+
+  auto raw_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0),
+    [span_dx_aff, span_w_bar, span_omega, span_cone_offsets, span_element_cone_id] HD(i_t idx) {
+      i_t cone     = span_element_cone_id[idx];
+      i_t cone_off = span_cone_offsets[cone];
+      if (idx == cone_off) { return corrector_raw_t<f_t>{f_t(0), f_t(0), f_t(0)}; }
+      f_t dx_aff_j = span_dx_aff[idx];
+      return corrector_raw_t<f_t>{
+        span_w_bar[idx] * dx_aff_j, span_omega[idx] * dx_aff_j, dx_aff_j * dx_aff_j};
+    });
+  segmented_reduce<i_t, corrector_raw_t<f_t>>(raw_terms,
+                                              cuopt::make_span(cones.cone_offsets),
+                                              cones.K,
+                                              cones.scratch.corrector_raw,
+                                              cones.scratch.segmented_reduce_workspace,
+                                              corrector_raw_sum_t<f_t>{},
+                                              corrector_raw_t<f_t>{f_t(0), f_t(0), f_t(0)},
+                                              stream);
+
+  i_t grid_dim = (cones.m_c + flat_block_dim - 1) / flat_block_dim;
+  fused_corrector_write_kernel<i_t, f_t>
+    <<<grid_dim, flat_block_dim, 0, stream>>>(cones.s,
+                                              cones.lambda,
+                                              dx_aff,
+                                              cuopt::make_span(cones.omega),
+                                              cuopt::make_span(cones.w_bar),
+                                              cuopt::make_span(cones.inv_eta),
+                                              cuopt::make_span(cones.inv_1pw0),
+                                              cuopt::make_span(cones.rho),
+                                              cuopt::make_span(cones.scratch.corrector_raw),
+                                              out,
+                                              cuopt::make_span(cones.cone_offsets),
+                                              cuopt::make_span(cones.element_cone_ids),
+                                              sigma_mu,
+                                              output_scale);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
 template <typename i_t, typename f_t>
-void recover_cone_dz(raft::device_span<const f_t> dx,
-                     const cone_data_t<i_t, f_t>& cones,
-                     const rmm::device_uvector<f_t>& cone_rhs_term,
-                     rmm::device_uvector<f_t>& hinv2_dx,
-                     raft::device_span<f_t> dz,
-                     rmm::cuda_stream_view stream)
+void recover_cone_dz_from_target(raft::device_span<const f_t> dx,
+                                 cone_data_t<i_t, f_t>& cones,
+                                 raft::device_span<const f_t> cone_target,
+                                 rmm::device_uvector<f_t>& hinv2_dx,
+                                 raft::device_span<f_t> dz,
+                                 rmm::cuda_stream_view stream)
 {
   hinv2_dx.resize(cones.m_c, stream);
   if (cones.K == 0) return;
 
-  apply_Hinv2_kernel<i_t, f_t, medium_block_dim>
-    <<<cones.K, medium_block_dim, 0, stream>>>(dx,
-                                               cuopt::make_span(hinv2_dx),
-                                               cuopt::make_span(cones.w_bar),
-                                               cuopt::make_span(cones.inv_eta),
-                                               cuopt::make_span(cones.cone_offsets),
-                                               cones.K);
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  apply_hinv2<i_t, f_t>(dx, cuopt::make_span(hinv2_dx), cones, stream);
 
-  thrust::for_each_n(
-    rmm::exec_policy(stream),
-    thrust::make_counting_iterator<i_t>(0),
-    cones.m_c,
-    [span_rhs   = cuopt::make_span(cone_rhs_term),
-     span_hinv2 = cuopt::make_span(hinv2_dx),
-     span_dz    = dz] __device__(i_t j) { span_dz[j] = -span_rhs[j] - span_hinv2[j]; });
+  auto span_target = cone_target;
+  auto span_hinv2  = cuopt::make_span(hinv2_dx);
+  auto span_dz     = dz;
+  thrust::for_each_n(rmm::exec_policy(stream),
+                     thrust::make_counting_iterator<i_t>(0),
+                     cones.m_c,
+                     [span_target, span_hinv2, span_dz] __device__(i_t j) {
+                       span_dz[j] = span_target[j] - span_hinv2[j];
+                     });
 }
 
 template <typename i_t, typename f_t>
 void accumulate_cone_hinv2_matvec(raft::device_span<const f_t> x,
-                                  const cone_data_t<i_t, f_t>& cones,
+                                  cone_data_t<i_t, f_t>& cones,
                                   rmm::device_uvector<f_t>& hinv2_x,
                                   raft::device_span<f_t> out,
                                   rmm::cuda_stream_view stream)
@@ -1001,21 +646,14 @@ void accumulate_cone_hinv2_matvec(raft::device_span<const f_t> x,
   hinv2_x.resize(cones.m_c, stream);
   if (cones.K == 0) return;
 
-  apply_Hinv2_kernel<i_t, f_t, medium_block_dim>
-    <<<cones.K, medium_block_dim, 0, stream>>>(x,
-                                               cuopt::make_span(hinv2_x),
-                                               cuopt::make_span(cones.w_bar),
-                                               cuopt::make_span(cones.inv_eta),
-                                               cuopt::make_span(cones.cone_offsets),
-                                               cones.K);
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  apply_hinv2<i_t, f_t>(x, cuopt::make_span(hinv2_x), cones, stream);
 
+  auto span_hinv2 = cuopt::make_span(hinv2_x);
+  auto span_out   = out;
   thrust::for_each_n(rmm::exec_policy(stream),
                      thrust::make_counting_iterator<i_t>(0),
                      cones.m_c,
-                     [span_hinv2 = cuopt::make_span(hinv2_x), span_out = out] __device__(i_t j) {
-                       span_out[j] += span_hinv2[j];
-                     });
+                     [span_hinv2, span_out] __device__(i_t j) { span_out[j] += span_hinv2[j]; });
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,11 +664,44 @@ void accumulate_cone_hinv2_matvec(raft::device_span<const f_t> x,
 //   - `csr_indices[e]` gives the destination slot in `augmented_x`
 //   - `q_values[e]` stores any pre-merged Q contribution for that slot
 //
-// For each flat entry we identify its owning cone from `block_offsets`,
-// recover local (r, c) coordinates, evaluate H_k^{-2}(r, c), and scatter
+// For each flat entry we load its precomputed owning cone id, recover local
+// (r, c) coordinates, evaluate H_k^{-2}(r, c), and write
 //   -(H_k^{-2}(r, c) + q_values[e])
 // into `augmented_x[csr_indices[e]]`.
 // ---------------------------------------------------------------------------
+template <typename i_t, typename f_t>
+__global__ void scatter_hinv2_into_augmented_kernel(
+  raft::device_span<f_t> augmented_x,
+  raft::device_span<const i_t> csr_indices,
+  raft::device_span<const f_t> q_values,
+  raft::device_span<const f_t> w_bar,
+  raft::device_span<const f_t> inv_eta,
+  raft::device_span<const i_t> cone_offsets,
+  raft::device_span<const i_t> block_offsets,
+  raft::device_span<const i_t> block_entry_cone_ids)
+{
+  i_t e = static_cast<i_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (e >= static_cast<i_t>(csr_indices.size())) return;
+
+  i_t cone    = block_entry_cone_ids[e];
+  i_t off     = cone_offsets[cone];
+  i_t q       = cone_offsets[cone + 1] - off;
+  i_t blk_off = block_offsets[cone];
+  i_t local   = e - blk_off;
+  i_t r       = local / q;
+  i_t c       = local % q;
+
+  f_t ie_sq           = inv_eta[cone] * inv_eta[cone];
+  f_t w0              = w_bar[off];
+  f_t u_r             = (r == 0) ? w0 : -w_bar[off + r];
+  f_t u_c             = (c == 0) ? w0 : -w_bar[off + c];
+  f_t val             = f_t(2) * u_r * ie_sq * u_c;
+  f_t diag_correction = (r == 0) ? -ie_sq : ie_sq;
+  if (r == c) { val += diag_correction; }
+
+  augmented_x[csr_indices[e]] = -val - q_values[e];
+}
+
 template <typename i_t, typename f_t>
 void scatter_hinv2_into_augmented(const cone_data_t<i_t, f_t>& cones,
                                   rmm::device_uvector<f_t>& augmented_x,
@@ -1041,156 +712,246 @@ void scatter_hinv2_into_augmented(const cone_data_t<i_t, f_t>& cones,
   i_t count = static_cast<i_t>(csr_indices.size());
   if (count == 0) return;
 
-  auto values = thrust::make_transform_iterator(
-    thrust::make_counting_iterator<i_t>(0),
-    [span_w_bar         = cuopt::make_span(cones.w_bar),
-     span_inv_eta       = cuopt::make_span(cones.inv_eta),
-     span_block_offsets = cuopt::make_span(cones.block_offsets),
-     span_cone_offsets  = cuopt::make_span(cones.cone_offsets),
-     span_q_values      = cuopt::make_span(q_values)] __device__(i_t e) -> f_t {
-      i_t lo = 0;
-      i_t hi = static_cast<i_t>(span_block_offsets.size()) - 1;
-      while (lo + 1 < hi) {
-        i_t mid = lo + (hi - lo) / 2;
-        if (span_block_offsets[mid] <= e) {
-          lo = mid;
-        } else {
-          hi = mid;
-        }
-      }
-      i_t cone    = lo;
-      i_t off     = span_cone_offsets[cone];
-      i_t q       = span_cone_offsets[cone + 1] - off;
-      i_t blk_off = span_block_offsets[cone];
-      i_t local   = e - blk_off;
-      i_t r       = local / q;
-      i_t c       = local % q;
+  cuopt_assert(count == static_cast<i_t>(cones.block_entry_cone_ids.size()),
+               "scatter expects one flat entry per cone-block coefficient");
 
-      f_t ie_sq           = span_inv_eta[cone] * span_inv_eta[cone];
-      f_t w0              = span_w_bar[off];
-      f_t u_r             = (r == 0) ? w0 : -span_w_bar[off + r];
-      f_t u_c             = (c == 0) ? w0 : -span_w_bar[off + c];
-      f_t val             = f_t(2) * u_r * ie_sq * u_c;
-      f_t diag_correction = (r == 0) ? -ie_sq : ie_sq;
-      if (r == c) { val += diag_correction; }
-
-      return -val - span_q_values[e];
-    });
-
-  thrust::scatter(
-    rmm::exec_policy(stream), values, values + count, csr_indices.begin(), augmented_x.begin());
-}
-
-// ---------------------------------------------------------------------------
-// Compute the maximum feasible step length for the cone portion of (x, z).
-//
-// Launches step_length_kernel (one CTA per cone), then reduces the per-cone
-// results to a single scalar.  Returns min over all cones of the step length
-// that keeps both x_K + alpha*dx_K and z_K + alpha*dz_K in their cones.
-// ---------------------------------------------------------------------------
-template <typename i_t, typename f_t>
-f_t compute_cone_step_length(const cone_data_t<i_t, f_t>& cones,
-                             raft::device_span<const f_t> x_K,
-                             raft::device_span<const f_t> dx_K,
-                             raft::device_span<const f_t> z_K,
-                             raft::device_span<const f_t> dz_K,
-                             f_t alpha_max,
-                             rmm::cuda_stream_view stream)
-{
-  if (cones.K == 0) return alpha_max;
-
-  rmm::device_uvector<f_t> d_alpha(cones.K, stream);
-  step_length_kernel<i_t, f_t, medium_block_dim>
-    <<<cones.K, medium_block_dim, 0, stream>>>(x_K,
-                                               dx_K,
-                                               z_K,
-                                               dz_K,
-                                               cuopt::make_span(d_alpha),
-                                               cuopt::make_span(cones.cone_offsets),
-                                               cones.K,
-                                               alpha_max);
+  i_t grid_dim = (count + flat_block_dim - 1) / flat_block_dim;
+  scatter_hinv2_into_augmented_kernel<i_t, f_t>
+    <<<grid_dim, flat_block_dim, 0, stream>>>(cuopt::make_span(augmented_x),
+                                              cuopt::make_span(csr_indices),
+                                              cuopt::make_span(q_values),
+                                              cuopt::make_span(cones.w_bar),
+                                              cuopt::make_span(cones.inv_eta),
+                                              cuopt::make_span(cones.cone_offsets),
+                                              cuopt::make_span(cones.block_offsets),
+                                              cuopt::make_span(cones.block_entry_cone_ids));
   RAFT_CUDA_TRY(cudaPeekAtLastError());
-
-  f_t result = thrust::reduce(
-    rmm::exec_policy(stream), d_alpha.begin(), d_alpha.end(), alpha_max, thrust::minimum<f_t>());
-  return result;
-}
-
-template <typename i_t, typename f_t>
-f_t compute_single_cone_step_length(const cone_data_t<i_t, f_t>& cones,
-                                    raft::device_span<const f_t> u_K,
-                                    raft::device_span<const f_t> du_K,
-                                    f_t alpha_max,
-                                    rmm::cuda_stream_view stream)
-{
-  if (cones.K == 0) return alpha_max;
-
-  rmm::device_uvector<f_t> d_alpha(cones.K, stream);
-  step_length_single_kernel<i_t, f_t, medium_block_dim><<<cones.K, medium_block_dim, 0, stream>>>(
-    u_K, du_K, cuopt::make_span(d_alpha), cuopt::make_span(cones.cone_offsets), cones.K, alpha_max);
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
-
-  return thrust::reduce(
-    rmm::exec_policy(stream), d_alpha.begin(), d_alpha.end(), alpha_max, thrust::minimum<f_t>());
 }
 
 // ---------------------------------------------------------------------------
-// Shift cone slices of a vector into the strict interior of their cones.
-// Operates on a subspan of the global vector (pre-sliced to cone portion).
+// Compute per-cone step lengths, then reduce them to the global maximum
+// feasible primal/dual step.
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t>
-void launch_interior_shift(raft::device_span<f_t> u_K,
-                           const cone_data_t<i_t, f_t>& cones,
-                           rmm::cuda_stream_view stream)
+void compute_cone_step_length_per_cone(cone_data_t<i_t, f_t>& cones,
+                                       raft::device_span<const f_t> x_K,
+                                       raft::device_span<const f_t> dx_K,
+                                       raft::device_span<const f_t> z_K,
+                                       raft::device_span<const f_t> dz_K,
+                                       raft::device_span<f_t> alpha_primal,
+                                       raft::device_span<f_t> alpha_dual,
+                                       f_t alpha_max,
+                                       rmm::cuda_stream_view stream)
 {
+  cuopt_assert(static_cast<i_t>(alpha_primal.size()) == cones.K &&
+                 static_cast<i_t>(alpha_dual.size()) == cones.K,
+               "step-length outputs must match cone count");
   if (cones.K == 0) return;
-  interior_shift_kernel<i_t, f_t, medium_block_dim>
-    <<<cones.K, medium_block_dim, 0, stream>>>(u_K, cuopt::make_span(cones.cone_offsets), cones.K);
+
+  auto span_offsets = cuopt::make_span(cones.cone_offsets);
+  auto span_elem    = cuopt::make_span(cones.element_cone_ids);
+
+  auto s_du1_sq = cones.scratch.step_s_du1_sq();
+  auto s_u1du1  = cones.scratch.step_s_u1du1();
+  auto s_u1_sq  = cones.scratch.step_s_u1_sq();
+  auto l_du1_sq = cones.scratch.step_l_du1_sq();
+  auto l_u1du1  = cones.scratch.step_l_u1du1();
+  auto l_u1_sq  = cones.scratch.step_l_u1_sq();
+
+  auto span_x_K  = x_K;
+  auto span_dx_K = dx_K;
+  auto span_z_K  = z_K;
+  auto span_dz_K = dz_K;
+
+  auto s_du1_sq_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0), [span_dx_K, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_dx_K[idx] * span_dx_K[idx];
+    });
+  segmented_sum<i_t, f_t>(s_du1_sq_terms,
+                          span_offsets,
+                          cones.K,
+                          s_du1_sq,
+                          cones.scratch.segmented_reduce_workspace,
+                          stream);
+
+  auto s_u1du1_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0),
+    [span_x_K, span_dx_K, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_x_K[idx] * span_dx_K[idx];
+    });
+  segmented_sum<i_t, f_t>(s_u1du1_terms,
+                          span_offsets,
+                          cones.K,
+                          s_u1du1,
+                          cones.scratch.segmented_reduce_workspace,
+                          stream);
+
+  auto s_u1_sq_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0), [span_x_K, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_x_K[idx] * span_x_K[idx];
+    });
+  segmented_sum<i_t, f_t>(s_u1_sq_terms,
+                          span_offsets,
+                          cones.K,
+                          s_u1_sq,
+                          cones.scratch.segmented_reduce_workspace,
+                          stream);
+
+  auto l_du1_sq_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0), [span_dz_K, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_dz_K[idx] * span_dz_K[idx];
+    });
+  segmented_sum<i_t, f_t>(l_du1_sq_terms,
+                          span_offsets,
+                          cones.K,
+                          l_du1_sq,
+                          cones.scratch.segmented_reduce_workspace,
+                          stream);
+
+  auto l_u1du1_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0),
+    [span_z_K, span_dz_K, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_z_K[idx] * span_dz_K[idx];
+    });
+  segmented_sum<i_t, f_t>(l_u1du1_terms,
+                          span_offsets,
+                          cones.K,
+                          l_u1du1,
+                          cones.scratch.segmented_reduce_workspace,
+                          stream);
+
+  auto l_u1_sq_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0), [span_z_K, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_z_K[idx] * span_z_K[idx];
+    });
+  segmented_sum<i_t, f_t>(l_u1_sq_terms,
+                          span_offsets,
+                          cones.K,
+                          l_u1_sq,
+                          cones.scratch.segmented_reduce_workspace,
+                          stream);
+
+  i_t grid_dim = (cones.K + flat_block_dim - 1) / flat_block_dim;
+  step_length_pair_kernel<i_t, f_t><<<grid_dim, flat_block_dim, 0, stream>>>(x_K,
+                                                                             dx_K,
+                                                                             z_K,
+                                                                             dz_K,
+                                                                             alpha_primal,
+                                                                             alpha_dual,
+                                                                             s_du1_sq,
+                                                                             s_u1du1,
+                                                                             s_u1_sq,
+                                                                             l_du1_sq,
+                                                                             l_u1du1,
+                                                                             l_u1_sq,
+                                                                             span_offsets,
+                                                                             alpha_max,
+                                                                             cones.K);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename i_t, typename f_t>
+std::pair<f_t, f_t> compute_cone_step_length(cone_data_t<i_t, f_t>& cones,
+                                             raft::device_span<const f_t> x_K,
+                                             raft::device_span<const f_t> dx_K,
+                                             raft::device_span<const f_t> z_K,
+                                             raft::device_span<const f_t> dz_K,
+                                             f_t alpha_max,
+                                             rmm::cuda_stream_view stream)
+{
+  if (cones.K == 0) return {alpha_max, alpha_max};
+
+  auto alpha_primal = cones.scratch.step_alpha_primal_span();
+  auto alpha_dual   = cones.scratch.step_alpha_dual_span();
+
+  compute_cone_step_length_per_cone<i_t, f_t>(
+    cones, x_K, dx_K, z_K, dz_K, alpha_primal, alpha_dual, alpha_max, stream);
+
+  f_t primal = thrust::reduce(rmm::exec_policy(stream),
+                              alpha_primal.begin(),
+                              alpha_primal.end(),
+                              alpha_max,
+                              thrust::minimum<f_t>());
+  f_t dual   = thrust::reduce(rmm::exec_policy(stream),
+                            alpha_dual.begin(),
+                            alpha_dual.end(),
+                            alpha_max,
+                            thrust::minimum<f_t>());
+  return {primal, dual};
 }
 
 template <typename i_t, typename f_t>
 void launch_nt_scaling(cone_data_t<i_t, f_t>& cones, rmm::cuda_stream_view stream)
 {
-  auto launch_streaming_bucket = [&](auto& cone_ids, auto block_dim_ic) {
-    constexpr int block_dim = std::remove_cvref_t<decltype(block_dim_ic)>::value;
-    i_t bucket_size         = static_cast<i_t>(cone_ids.size());
-    if (bucket_size == 0) return;
+  if (cones.K == 0) return;
 
-    nt_scaling_kernel<i_t, f_t, block_dim>
-      <<<bucket_size, block_dim, 0, stream>>>(cones.s,
+  auto nt_s1_sq = cones.scratch.nt_s1_sq();
+  auto nt_l1_sq = cones.scratch.nt_l1_sq();
+  auto nt_sl    = cones.scratch.nt_sl();
+
+  auto span_s       = cones.s;
+  auto span_lambda  = cones.lambda;
+  auto span_offsets = cuopt::make_span(cones.cone_offsets);
+  auto span_elem    = cuopt::make_span(cones.element_cone_ids);
+
+  auto s1_sq_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0), [span_s, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_s[idx] * span_s[idx];
+    });
+  segmented_sum<i_t, f_t>(
+    s1_sq_terms, span_offsets, cones.K, nt_s1_sq, cones.scratch.segmented_reduce_workspace, stream);
+
+  auto l1_sq_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0), [span_lambda, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_lambda[idx] * span_lambda[idx];
+    });
+  segmented_sum<i_t, f_t>(
+    l1_sq_terms, span_offsets, cones.K, nt_l1_sq, cones.scratch.segmented_reduce_workspace, stream);
+
+  auto sl_terms = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0),
+    [span_s, span_lambda, span_offsets, span_elem] HD(i_t idx) {
+      i_t cone = span_elem[idx];
+      return (idx == span_offsets[cone]) ? f_t(0) : span_s[idx] * span_lambda[idx];
+    });
+  segmented_sum<i_t, f_t>(
+    sl_terms, span_offsets, cones.K, nt_sl, cones.scratch.segmented_reduce_workspace, stream);
+
+  i_t scalar_grid_dim = (cones.K + flat_block_dim - 1) / flat_block_dim;
+  nt_scaling_scalar_kernel<i_t, f_t>
+    <<<scalar_grid_dim, flat_block_dim, 0, stream>>>(cones.s,
+                                                     cones.lambda,
+                                                     span_offsets,
+                                                     nt_s1_sq,
+                                                     nt_l1_sq,
+                                                     nt_sl,
+                                                     cuopt::make_span(cones.inv_eta),
+                                                     cuopt::make_span(cones.inv_1pw0),
+                                                     cuopt::make_span(cones.w_bar),
+                                                     cuopt::make_span(cones.omega),
+                                                     cuopt::make_span(cones.rho),
+                                                     cones.K);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  i_t grid_dim = (cones.m_c + flat_block_dim - 1) / flat_block_dim;
+  nt_scaling_tail_kernel<i_t, f_t>
+    <<<grid_dim, flat_block_dim, 0, stream>>>(cones.s,
                                               cones.lambda,
-                                              cuopt::make_span(cones.eta),
                                               cuopt::make_span(cones.inv_eta),
-                                              cuopt::make_span(cones.inv_1pw0),
+                                              cuopt::make_span(cones.rho),
                                               cuopt::make_span(cones.w_bar),
                                               cuopt::make_span(cones.omega),
-                                              cuopt::make_span(cones.rho),
-                                              cuopt::make_span(cones.cone_offsets),
-                                              cuopt::make_span(cone_ids),
-                                              bucket_size);
-  };
-
-  i_t small_count = static_cast<i_t>(cones.small_cone_ids.size());
-  if (small_count > 0) {
-    constexpr int warps_per_block = small_block_dim / 32;
-    i_t grid_dim                  = (small_count + warps_per_block - 1) / warps_per_block;
-    nt_scaling_small_kernel<i_t, f_t, small_block_dim>
-      <<<grid_dim, small_block_dim, 0, stream>>>(cones.s,
-                                                 cones.lambda,
-                                                 cuopt::make_span(cones.eta),
-                                                 cuopt::make_span(cones.inv_eta),
-                                                 cuopt::make_span(cones.inv_1pw0),
-                                                 cuopt::make_span(cones.w_bar),
-                                                 cuopt::make_span(cones.omega),
-                                                 cuopt::make_span(cones.rho),
-                                                 cuopt::make_span(cones.cone_offsets),
-                                                 cuopt::make_span(cones.small_cone_ids),
-                                                 small_count);
-  }
-
-  launch_streaming_bucket(cones.medium_cone_ids, std::integral_constant<int, medium_block_dim>{});
-  launch_streaming_bucket(cones.large_cone_ids, std::integral_constant<int, large_block_dim>{});
+                                              span_offsets,
+                                              span_elem);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
 }  // namespace cuopt::linear_programming::dual_simplex

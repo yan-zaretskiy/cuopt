@@ -327,16 +327,6 @@ auto ref_fused_corrector_single(const std::vector<f_t>& dx_aff,
 }
 
 template <typename f_t>
-auto ref_interior_shift_single(std::vector<f_t> u) -> std::vector<f_t>
-{
-  if (u.empty()) { return u; }
-
-  f_t gap = tail_norm(u) - u[0];
-  if (gap >= f_t(0)) { u[0] += f_t(1) + gap; }
-  return u;
-}
-
-template <typename f_t>
 auto make_patterned_cone(int q, f_t head, f_t scale) -> std::vector<f_t>
 {
   std::vector<f_t> cone(q, f_t(0));
@@ -401,54 +391,39 @@ class second_order_cone_test : public ::testing::Test {
     }
   }
 
-  void launch_apply_hinv(const rmm::device_uvector<f_t>& z,
-                         rmm::device_uvector<f_t>& out,
-                         const rmm::device_uvector<f_t>& w_bar,
-                         const rmm::device_uvector<f_t>& inv_eta,
-                         const rmm::device_uvector<f_t>& inv_1pw0,
-                         const rmm::device_uvector<i_t>& cone_offsets,
-                         i_t k)
-  {
-    apply_Hinv_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(z),
-                                                             cuopt::make_span(out),
-                                                             cuopt::make_span(w_bar),
-                                                             cuopt::make_span(inv_eta),
-                                                             cuopt::make_span(inv_1pw0),
-                                                             cuopt::make_span(cone_offsets),
-                                                             k);
-    RAFT_CUDA_TRY(cudaPeekAtLastError());
-    sync();
-  }
-
-  void launch_step_length(const rmm::device_uvector<f_t>& s,
-                          const rmm::device_uvector<f_t>& ds,
-                          const rmm::device_uvector<f_t>& lambda,
-                          const rmm::device_uvector<f_t>& dlambda,
+  void launch_step_length(rmm::device_uvector<f_t>& s,
+                          rmm::device_uvector<f_t>& ds,
+                          rmm::device_uvector<f_t>& lambda,
+                          rmm::device_uvector<f_t>& dlambda,
                           rmm::device_uvector<f_t>& alpha,
                           const rmm::device_uvector<i_t>& cone_offsets,
                           i_t k,
                           f_t alpha_max)
   {
-    step_length_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(s),
-                                                              cuopt::make_span(ds),
-                                                              cuopt::make_span(lambda),
-                                                              cuopt::make_span(dlambda),
-                                                              cuopt::make_span(alpha),
-                                                              cuopt::make_span(cone_offsets),
-                                                              k,
-                                                              alpha_max);
-    RAFT_CUDA_TRY(cudaPeekAtLastError());
+    auto h_offsets = copy_to_host(cone_offsets);
+    std::vector<i_t> dims(k, 0);
+    for (i_t cone = 0; cone < k; ++cone) {
+      dims[cone] = h_offsets[cone + 1] - h_offsets[cone];
+    }
+    cone_data_t<i_t, f_t> cones(k, dims, cuopt::make_span(s), cuopt::make_span(lambda), stream_);
+    rmm::device_uvector<f_t> alpha_dual(k, stream_);
+    launch_nt_scaling(cones, stream_);
+    compute_cone_step_length_per_cone<i_t, f_t>(cones,
+                                                cuopt::make_span(s),
+                                                cuopt::make_span(ds),
+                                                cuopt::make_span(lambda),
+                                                cuopt::make_span(dlambda),
+                                                cuopt::make_span(alpha),
+                                                cuopt::make_span(alpha_dual),
+                                                alpha_max,
+                                                stream_);
     sync();
-  }
-
-  void launch_interior_shift(rmm::device_uvector<f_t>& u,
-                             const rmm::device_uvector<i_t>& cone_offsets,
-                             i_t k)
-  {
-    interior_shift_kernel<i_t, f_t, dim>
-      <<<k, dim, 0, stream_>>>(cuopt::make_span(u), cuopt::make_span(cone_offsets), k);
-    RAFT_CUDA_TRY(cudaPeekAtLastError());
-    sync();
+    auto h_primal = copy_to_host(alpha);
+    auto h_dual   = copy_to_host(alpha_dual);
+    for (i_t i = 0; i < k; ++i) {
+      h_primal[i] = std::min(h_primal[i], h_dual[i]);
+    }
+    copy_to_device(alpha, h_primal);
   }
 
   void launch_apply_hinv2(const rmm::device_uvector<f_t>& v,
@@ -458,77 +433,64 @@ class second_order_cone_test : public ::testing::Test {
                           const rmm::device_uvector<i_t>& cone_offsets,
                           i_t k)
   {
-    apply_Hinv2_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(v),
-                                                              cuopt::make_span(out),
-                                                              cuopt::make_span(w_bar),
-                                                              cuopt::make_span(inv_eta),
-                                                              cuopt::make_span(cone_offsets),
-                                                              k);
-    RAFT_CUDA_TRY(cudaPeekAtLastError());
-    sync();
-  }
-
-  void launch_jordan_product(const rmm::device_uvector<f_t>& a,
-                             const rmm::device_uvector<f_t>& b,
-                             rmm::device_uvector<f_t>& out,
-                             const rmm::device_uvector<i_t>& cone_offsets,
-                             i_t k)
-  {
-    jordan_product_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(a),
-                                                                 cuopt::make_span(b),
-                                                                 cuopt::make_span(out),
-                                                                 cuopt::make_span(cone_offsets),
-                                                                 k);
-    RAFT_CUDA_TRY(cudaPeekAtLastError());
-    sync();
-  }
-
-  void launch_inverse_jordan_product(const rmm::device_uvector<f_t>& omega,
-                                     const rmm::device_uvector<f_t>& r,
-                                     const rmm::device_uvector<f_t>& rho,
-                                     rmm::device_uvector<f_t>& out,
-                                     const rmm::device_uvector<i_t>& cone_offsets,
-                                     i_t k)
-  {
-    inverse_jordan_product_kernel<i_t, f_t, dim>
-      <<<k, dim, 0, stream_>>>(cuopt::make_span(omega),
-                               cuopt::make_span(r),
-                               cuopt::make_span(rho),
-                               cuopt::make_span(out),
-                               cuopt::make_span(cone_offsets),
-                               k);
-    RAFT_CUDA_TRY(cudaPeekAtLastError());
+    auto h_offsets = copy_to_host(cone_offsets);
+    std::vector<i_t> h_element_cone_ids(v.size(), 0);
+    for (i_t cone = 0; cone < k; ++cone) {
+      std::fill(h_element_cone_ids.begin() + h_offsets[cone],
+                h_element_cone_ids.begin() + h_offsets[cone + 1],
+                cone);
+    }
+    auto d_element_cone_ids = make_device_vector(h_element_cone_ids);
+    rmm::device_uvector<f_t> tail_dot(k, stream_);
+    rmm::device_uvector<std::uint8_t> workspace(0, stream_);
+    apply_hinv2<i_t, f_t>(cuopt::make_span(v),
+                          cuopt::make_span(out),
+                          cuopt::make_span(w_bar),
+                          cuopt::make_span(inv_eta),
+                          cuopt::make_span(cone_offsets),
+                          cuopt::make_span(d_element_cone_ids),
+                          cuopt::make_span(tail_dot),
+                          workspace,
+                          k,
+                          stream_);
     sync();
   }
 
   void launch_fused_corrector(const rmm::device_uvector<f_t>& dx_aff,
-                              const cone_data_t<i_t, f_t>& cones,
+                              cone_data_t<i_t, f_t>& cones,
                               f_t sigma_mu,
                               rmm::device_uvector<f_t>& out)
   {
-    compute_combined_cone_rhs_term(cuopt::make_span(dx_aff), cones, sigma_mu, out, stream_);
+    out.resize(cones.m_c, stream_);
+    compute_combined_cone_rhs_term(
+      cuopt::make_span(dx_aff), cones, sigma_mu, cuopt::make_span(out), stream_);
     sync();
   }
 
-  void launch_affine_cone_rhs(const cone_data_t<i_t, f_t>& cones, rmm::device_uvector<f_t>& out)
+  void launch_affine_cone_rhs(cone_data_t<i_t, f_t>& cones, rmm::device_uvector<f_t>& out)
   {
-    compute_affine_cone_rhs_term(cones, out, stream_);
+    out.resize(cones.m_c, stream_);
+    compute_affine_cone_rhs_term(cones, cuopt::make_span(out), stream_);
     sync();
   }
 
-  void launch_recover_cone_dz(const rmm::device_uvector<f_t>& dx,
-                              const cone_data_t<i_t, f_t>& cones,
-                              const rmm::device_uvector<f_t>& cone_rhs_term,
-                              rmm::device_uvector<f_t>& hinv2_dx,
-                              rmm::device_uvector<f_t>& dz)
+  void launch_recover_cone_dz_from_target(const rmm::device_uvector<f_t>& dx,
+                                          cone_data_t<i_t, f_t>& cones,
+                                          const rmm::device_uvector<f_t>& cone_target,
+                                          rmm::device_uvector<f_t>& hinv2_dx,
+                                          rmm::device_uvector<f_t>& dz)
   {
-    recover_cone_dz(
-      cuopt::make_span(dx), cones, cone_rhs_term, hinv2_dx, cuopt::make_span(dz), stream_);
+    recover_cone_dz_from_target(cuopt::make_span(dx),
+                                cones,
+                                cuopt::make_span(cone_target),
+                                hinv2_dx,
+                                cuopt::make_span(dz),
+                                stream_);
     sync();
   }
 
   void launch_accumulate_cone_hinv2(const rmm::device_uvector<f_t>& x,
-                                    const cone_data_t<i_t, f_t>& cones,
+                                    cone_data_t<i_t, f_t>& cones,
                                     rmm::device_uvector<f_t>& hinv2_x,
                                     rmm::device_uvector<f_t>& out)
   {
@@ -547,25 +509,107 @@ class second_order_cone_test : public ::testing::Test {
   }
 };
 
-TEST_F(second_order_cone_test, cone_data_topology_and_bucket_partitioning)
+TEST_F(second_order_cone_test, cone_data_topology_and_flat_index_maps)
 {
-  std::vector<i_t> dims{1, 32, 33, 2048, 2049};
+  std::vector<i_t> dims{1, 2, 3, 4};
   cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()), dims, {}, {}, stream_);
 
   auto expected_offsets = build_offsets(dims);
   auto actual_offsets   = copy_to_host(cones.cone_offsets);
   auto actual_dims      = copy_to_host(cones.cone_dims);
-  auto small_ids        = copy_to_host(cones.small_cone_ids);
-  auto medium_ids       = copy_to_host(cones.medium_cone_ids);
-  auto large_ids        = copy_to_host(cones.large_cone_ids);
+  auto element_cone_ids = copy_to_host(cones.element_cone_ids);
+  auto block_cone_ids   = copy_to_host(cones.block_entry_cone_ids);
+
+  std::vector<i_t> expected_element_cone_ids;
+  for (i_t cone = 0; cone < static_cast<i_t>(dims.size()); ++cone) {
+    expected_element_cone_ids.insert(expected_element_cone_ids.end(), dims[cone], cone);
+  }
+
+  std::vector<i_t> expected_block_cone_ids;
+  for (i_t cone = 0; cone < static_cast<i_t>(dims.size()); ++cone) {
+    expected_block_cone_ids.insert(expected_block_cone_ids.end(), dims[cone] * dims[cone], cone);
+  }
 
   EXPECT_EQ(cones.K, static_cast<i_t>(dims.size()));
   EXPECT_EQ(cones.m_c, expected_offsets.back());
   EXPECT_EQ(actual_offsets, expected_offsets);
   EXPECT_EQ(actual_dims, dims);
-  EXPECT_EQ(small_ids, std::vector<i_t>({0, 1}));
-  EXPECT_EQ(medium_ids, std::vector<i_t>({2, 3}));
-  EXPECT_EQ(large_ids, std::vector<i_t>({4}));
+  EXPECT_EQ(element_cone_ids, expected_element_cone_ids);
+  EXPECT_EQ(block_cone_ids, expected_block_cone_ids);
+}
+
+TEST_F(second_order_cone_test, cone_data_reuses_named_scratch_slots)
+{
+  std::vector<std::vector<f_t>> s_cones{{5.0, 1.0, 1.0}, {6.0, 1.0, -0.5, 0.25, 0.1}};
+  std::vector<std::vector<f_t>> ds_cones{{-0.5, 0.1, 0.1}, {-0.2, 0.05, 0.03, -0.02, 0.01}};
+  std::vector<std::vector<f_t>> lambda_cones{{5.0, 1.0, 1.0}, {4.0, 0.2, 0.3, -0.1, 0.05}};
+  std::vector<std::vector<f_t>> dlambda_cones{{-0.5, 0.1, 0.1}, {-0.1, 0.02, -0.03, 0.01, -0.01}};
+  std::vector<i_t> dims{3, 5};
+
+  auto d_s       = make_device_vector(pack_cones(s_cones));
+  auto d_ds      = make_device_vector(pack_cones(ds_cones));
+  auto d_lambda  = make_device_vector(pack_cones(lambda_cones));
+  auto d_dlambda = make_device_vector(pack_cones(dlambda_cones));
+  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()),
+                              dims,
+                              cuopt::make_span(d_s),
+                              cuopt::make_span(d_lambda),
+                              stream_);
+
+  EXPECT_EQ(cones.scratch.step_s_du1_sq().size(), dims.size());
+  EXPECT_EQ(cones.scratch.step_s_u1du1().size(), dims.size());
+  EXPECT_EQ(cones.scratch.step_l_du1_sq().size(), dims.size());
+  EXPECT_EQ(cones.scratch.step_l_u1du1().size(), dims.size());
+  EXPECT_EQ(cones.scratch.hinv2_tail_dot().size(), dims.size());
+  EXPECT_EQ(cones.scratch.step_s_u1_sq().size(), dims.size());
+  EXPECT_EQ(cones.scratch.step_l_u1_sq().size(), dims.size());
+  EXPECT_EQ(cones.scratch.nt_s1_sq().size(), dims.size());
+  EXPECT_EQ(cones.scratch.nt_l1_sq().size(), dims.size());
+  EXPECT_EQ(cones.scratch.nt_sl().size(), dims.size());
+  EXPECT_EQ(cones.scratch.step_alpha_primal_span().size(), dims.size());
+  EXPECT_EQ(cones.scratch.step_alpha_dual_span().size(), dims.size());
+
+  auto s_du1_ptr   = cones.scratch.step_s_du1_sq().data();
+  auto s_u1du1_ptr = cones.scratch.step_s_u1du1().data();
+  auto l_du1_ptr   = cones.scratch.step_l_du1_sq().data();
+  auto l_u1du1_ptr = cones.scratch.step_l_u1du1().data();
+  auto hinv2_ptr   = cones.scratch.hinv2_tail_dot().data();
+  auto s_u1_sq_ptr = cones.scratch.step_s_u1_sq().data();
+  auto l_u1_sq_ptr = cones.scratch.step_l_u1_sq().data();
+  auto nt_s1_ptr   = cones.scratch.nt_s1_sq().data();
+  auto nt_l1_ptr   = cones.scratch.nt_l1_sq().data();
+  auto nt_sl_ptr   = cones.scratch.nt_sl().data();
+  auto alpha_p_ptr = cones.scratch.step_alpha_primal_span().data();
+  auto alpha_d_ptr = cones.scratch.step_alpha_dual_span().data();
+
+  EXPECT_EQ(hinv2_ptr, s_du1_ptr);
+  EXPECT_EQ(s_du1_ptr, nt_s1_ptr);
+  EXPECT_EQ(s_u1du1_ptr, nt_l1_ptr);
+  EXPECT_EQ(s_u1_sq_ptr, nt_sl_ptr);
+
+  compute_cone_step_length_per_cone<i_t, f_t>(cones,
+                                              cuopt::make_span(d_s),
+                                              cuopt::make_span(d_ds),
+                                              cuopt::make_span(d_lambda),
+                                              cuopt::make_span(d_dlambda),
+                                              cones.scratch.step_alpha_primal_span(),
+                                              cones.scratch.step_alpha_dual_span(),
+                                              f_t(10.0),
+                                              stream_);
+  sync();
+
+  EXPECT_EQ(s_du1_ptr, cones.scratch.step_s_du1_sq().data());
+  EXPECT_EQ(s_u1du1_ptr, cones.scratch.step_s_u1du1().data());
+  EXPECT_EQ(l_du1_ptr, cones.scratch.step_l_du1_sq().data());
+  EXPECT_EQ(l_u1du1_ptr, cones.scratch.step_l_u1du1().data());
+  EXPECT_EQ(hinv2_ptr, cones.scratch.hinv2_tail_dot().data());
+  EXPECT_EQ(s_u1_sq_ptr, cones.scratch.step_s_u1_sq().data());
+  EXPECT_EQ(l_u1_sq_ptr, cones.scratch.step_l_u1_sq().data());
+  EXPECT_EQ(nt_s1_ptr, cones.scratch.nt_s1_sq().data());
+  EXPECT_EQ(nt_l1_ptr, cones.scratch.nt_l1_sq().data());
+  EXPECT_EQ(nt_sl_ptr, cones.scratch.nt_sl().data());
+  EXPECT_EQ(alpha_p_ptr, cones.scratch.step_alpha_primal_span().data());
+  EXPECT_EQ(alpha_d_ptr, cones.scratch.step_alpha_dual_span().data());
 }
 
 TEST_F(second_order_cone_test, nt_scaling_matches_reference_for_small_cone)
@@ -582,7 +626,6 @@ TEST_F(second_order_cone_test, nt_scaling_matches_reference_for_small_cone)
 
   launch_nt_scaling(cones, stream_);
 
-  auto eta      = copy_to_host(cones.eta);
   auto inv_eta  = copy_to_host(cones.inv_eta);
   auto inv_1pw0 = copy_to_host(cones.inv_1pw0);
   auto rho      = copy_to_host(cones.rho);
@@ -591,7 +634,6 @@ TEST_F(second_order_cone_test, nt_scaling_matches_reference_for_small_cone)
 
   auto ref = ref_nt_scaling_single(s_cones[0], lambda_cones[0]);
 
-  EXPECT_NEAR(eta[0], ref.eta, 1e-12);
   EXPECT_NEAR(inv_eta[0], ref.inv_eta, 1e-12);
   EXPECT_NEAR(inv_1pw0[0], ref.inv_1pw0, 1e-12);
   EXPECT_NEAR(rho[0], ref.rho, 1e-12);
@@ -624,7 +666,6 @@ TEST_F(second_order_cone_test, nt_scaling_matches_reference_across_bucket_sizes)
 
   launch_nt_scaling(cones, stream_);
 
-  auto eta      = copy_to_host(cones.eta);
   auto inv_eta  = copy_to_host(cones.inv_eta);
   auto inv_1pw0 = copy_to_host(cones.inv_1pw0);
   auto rho      = copy_to_host(cones.rho);
@@ -634,7 +675,6 @@ TEST_F(second_order_cone_test, nt_scaling_matches_reference_across_bucket_sizes)
   for (i_t cone = 0; cone < static_cast<i_t>(dims.size()); ++cone) {
     auto ref = ref_nt_scaling_single(s_cones[cone], lambda_cones[cone]);
 
-    EXPECT_NEAR(eta[cone], ref.eta, 1e-10) << "cone " << cone;
     EXPECT_NEAR(inv_eta[cone], ref.inv_eta, 1e-10) << "cone " << cone;
     EXPECT_NEAR(inv_1pw0[cone], ref.inv_1pw0, 1e-10) << "cone " << cone;
     EXPECT_NEAR(rho[cone], ref.rho, 1e-10) << "cone " << cone;
@@ -661,14 +701,58 @@ TEST_F(second_order_cone_test, nt_scaling_omega_equals_H_times_lambda)
 
   launch_nt_scaling(cones, stream_);
 
-  auto eta      = copy_to_host(cones.eta);
+  auto inv_eta  = copy_to_host(cones.inv_eta);
   auto inv_1pw0 = copy_to_host(cones.inv_1pw0);
   auto w_bar    = copy_to_host(cones.w_bar);
   auto omega    = copy_to_host(cones.omega);
 
   // NT symmetry: omega should equal both H^{-1}s and H*lambda.
-  auto H_lambda = ref_apply_H_single(lambda_cones[0], w_bar, eta[0], inv_1pw0[0]);
+  auto H_lambda = ref_apply_H_single(lambda_cones[0], w_bar, f_t(1) / inv_eta[0], inv_1pw0[0]);
   expect_vector_near(omega, H_lambda, 1e-10, 1e-8, "omega_vs_H_lambda");
+}
+
+TEST_F(second_order_cone_test, nt_scaling_tail_identities_match_heads)
+{
+  std::vector<std::vector<f_t>> s_cones{{5.0, 1.0, -1.0, 0.5, 0.3}};
+  std::vector<std::vector<f_t>> lambda_cones{{4.0, 0.5, 1.0, -0.3, 0.2}};
+  std::vector<i_t> dims{5};
+
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
+
+  launch_nt_scaling(cones, stream_);
+
+  auto inv_eta = copy_to_host(cones.inv_eta);
+  auto rho     = copy_to_host(cones.rho);
+  auto w_bar   = copy_to_host(cones.w_bar);
+  auto omega   = copy_to_host(cones.omega);
+
+  f_t s_J       = std::sqrt(j_norm_sq(s_cones[0]));
+  f_t l_J       = std::sqrt(j_norm_sq(lambda_cones[0]));
+  f_t s_dot_raw = s_cones[0][0] * lambda_cones[0][0];
+  for (std::size_t j = 1; j < s_cones[0].size(); ++j) {
+    s_dot_raw += s_cones[0][j] * lambda_cones[0][j];
+  }
+  f_t s_dot_l       = s_dot_raw / (s_J * l_J);
+  f_t gamma         = std::sqrt(std::max(f_t(0), (f_t(1) + s_dot_l) * f_t(0.5)));
+  f_t w0_from_heads = (s_cones[0][0] / s_J + lambda_cones[0][0] / l_J) / (f_t(2) * gamma);
+
+  f_t omega_tail_sq = f_t(0);
+  f_t w_omega_tail  = f_t(0);
+  for (std::size_t j = 1; j < omega.size(); ++j) {
+    omega_tail_sq += omega[j] * omega[j];
+    w_omega_tail += w_bar[j] * omega[j];
+  }
+
+  EXPECT_NEAR(omega_tail_sq, omega[0] * omega[0] - rho[0], 1e-10)
+    << "||omega_1||^2 should be derived from omega_0 and rho";
+  EXPECT_NEAR(w_bar[0], w0_from_heads, 1e-10)
+    << "w_bar_0 should be derived directly from normalized cone heads";
+
+  f_t derived_w_omega = f_t(0.5) * (inv_eta[0] * s_cones[0][0] - lambda_cones[0][0] / inv_eta[0]);
+  EXPECT_NEAR(w_omega_tail, derived_w_omega, 1e-10)
+    << "w_bar_1^T omega_1 should be derived from cone heads";
 }
 
 TEST_F(second_order_cone_test, nt_scaling_near_boundary_is_stable)
@@ -684,60 +768,23 @@ TEST_F(second_order_cone_test, nt_scaling_near_boundary_is_stable)
 
   launch_nt_scaling(cones, stream_);
 
-  auto eta      = copy_to_host(cones.eta);
   auto inv_eta  = copy_to_host(cones.inv_eta);
   auto inv_1pw0 = copy_to_host(cones.inv_1pw0);
   auto w_bar    = copy_to_host(cones.w_bar);
   auto omega    = copy_to_host(cones.omega);
 
+  f_t eta_val = f_t(1) / inv_eta[0];
+
   EXPECT_NEAR(j_norm_sq(w_bar), f_t(1), 1e-8) << "w_bar J-norm not 1 near boundary";
   EXPECT_GT(w_bar[0], tail_norm(w_bar)) << "w_bar not interior near boundary";
 
   // Round-trip: H(omega) should equal s.
-  auto H_omega = ref_apply_H_single(omega, w_bar, eta[0], inv_1pw0[0]);
+  auto H_omega = ref_apply_H_single(omega, w_bar, eta_val, inv_1pw0[0]);
   expect_vector_near(H_omega, pack_cones(s_cones), 1e-8, 1e-6, "H_omega_vs_s_near_boundary");
 
   // Symmetry: omega should also equal H*lambda.
-  auto H_lambda = ref_apply_H_single(lambda_cones[0], w_bar, eta[0], inv_1pw0[0]);
+  auto H_lambda = ref_apply_H_single(lambda_cones[0], w_bar, eta_val, inv_1pw0[0]);
   expect_vector_near(omega, H_lambda, 1e-8, 1e-6, "omega_vs_H_lambda_near_boundary");
-}
-
-TEST_F(second_order_cone_test, apply_hinv_matches_reference_for_packed_cones)
-{
-  std::vector<i_t> dims{1, 3, 5};
-  auto offsets = build_offsets(dims);
-
-  std::vector<std::vector<f_t>> z_cones{{3.0}, {2.0, -1.0, 0.5}, {1.0, 0.25, -0.75, 0.5, -0.125}};
-  std::vector<std::vector<f_t>> w_bar_cones{
-    {1.0}, {0.0, 0.15, -0.05}, {0.0, 0.10, -0.20, 0.05, 0.15}};
-  std::vector<f_t> inv_eta_host{0.5, 1.25, 0.75};
-  std::vector<f_t> inv_1pw0_host(inv_eta_host.size(), 0.0);
-
-  for (std::size_t cone = 0; cone < w_bar_cones.size(); ++cone) {
-    f_t w1_sq = f_t(0);
-    for (std::size_t j = 1; j < w_bar_cones[cone].size(); ++j) {
-      w1_sq += w_bar_cones[cone][j] * w_bar_cones[cone][j];
-    }
-    w_bar_cones[cone][0] = std::sqrt(f_t(1) + w1_sq);
-    inv_1pw0_host[cone]  = f_t(1) / (f_t(1) + w_bar_cones[cone][0]);
-  }
-
-  auto z         = make_device_vector(pack_cones(z_cones));
-  auto w_bar     = make_device_vector(pack_cones(w_bar_cones));
-  auto inv_eta   = make_device_vector(inv_eta_host);
-  auto inv_1pw0  = make_device_vector(inv_1pw0_host);
-  auto d_offsets = make_device_vector(offsets);
-  rmm::device_uvector<f_t> out(z.size(), stream_);
-
-  launch_apply_hinv(z, out, w_bar, inv_eta, inv_1pw0, d_offsets, static_cast<i_t>(dims.size()));
-
-  auto actual_out = copy_to_host(out);
-  auto expected   = pack_cones(std::vector<std::vector<f_t>>{
-    ref_apply_hinv_single(z_cones[0], w_bar_cones[0], inv_eta_host[0], inv_1pw0_host[0]),
-    ref_apply_hinv_single(z_cones[1], w_bar_cones[1], inv_eta_host[1], inv_1pw0_host[1]),
-    ref_apply_hinv_single(z_cones[2], w_bar_cones[2], inv_eta_host[2], inv_1pw0_host[2])});
-
-  expect_vector_near(actual_out, expected, 1e-12, 1e-10, "apply_hinv");
 }
 
 TEST_F(second_order_cone_test, step_length_matches_reference_and_handles_q1)
@@ -938,33 +985,6 @@ TEST_F(second_order_cone_test, step_length_boundary_tightness)
   EXPECT_GT(j_norm_sq(l_int), 0.0) << "lambda not interior at (1-eps)*alpha";
 }
 
-TEST_F(second_order_cone_test, interior_shift_matches_reference_and_preserves_tail)
-{
-  std::vector<i_t> dims{1, 3, 4};
-  auto offsets = build_offsets(dims);
-
-  std::vector<std::vector<f_t>> cones{{-0.25}, {2.0, 0.3, 0.4}, {0.5, 0.6, 0.8, 0.0}};
-  auto packed   = pack_cones(cones);
-  auto expected = pack_cones(std::vector<std::vector<f_t>>{ref_interior_shift_single(cones[0]),
-                                                           ref_interior_shift_single(cones[1]),
-                                                           ref_interior_shift_single(cones[2])});
-
-  auto u         = make_device_vector(packed);
-  auto d_offsets = make_device_vector(offsets);
-  launch_interior_shift(u, d_offsets, static_cast<i_t>(dims.size()));
-
-  auto actual = copy_to_host(u);
-  expect_vector_near(actual, expected, 1e-12, 1e-10, "interior_shift");
-
-  for (std::size_t cone = 0; cone < dims.size(); ++cone) {
-    auto shifted = slice_cone(actual, offsets, static_cast<i_t>(cone));
-    EXPECT_GT(shifted[0], tail_norm(shifted));
-    for (std::size_t j = 1; j < shifted.size(); ++j) {
-      EXPECT_EQ(shifted[j], cones[cone][j]) << "cone " << cone << " tail " << j;
-    }
-  }
-}
-
 TEST_F(second_order_cone_test, apply_hinv2_matches_reference_for_packed_cones)
 {
   std::vector<i_t> dims{1, 3, 5};
@@ -998,94 +1018,6 @@ TEST_F(second_order_cone_test, apply_hinv2_matches_reference_for_packed_cones)
     ref_apply_hinv2_single(v_cones[2], w_bar_cones[2], inv_eta_host[2])});
 
   expect_vector_near(actual, expected, 1e-12, 1e-10, "apply_hinv2");
-}
-
-TEST_F(second_order_cone_test, apply_hinv2_equals_double_hinv_with_nt_scaling)
-{
-  std::vector<std::vector<f_t>> s_cones{{2.0, 0.5, 0.25}, {3.0, 0.25, -0.5, 0.75, -0.25}};
-  std::vector<std::vector<f_t>> lambda_cones{{1.5, -0.25, 0.1}, {2.5, -0.1, 0.3, -0.2, 0.15}};
-  std::vector<i_t> dims{3, 5};
-  auto offsets = build_offsets(dims);
-
-  auto d_s      = make_device_vector(pack_cones(s_cones));
-  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
-  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()),
-                              dims,
-                              cuopt::make_span(d_s),
-                              cuopt::make_span(d_lambda),
-                              stream_);
-
-  launch_nt_scaling(cones, stream_);
-
-  std::vector<std::vector<f_t>> v_cones{{1.0, -0.3, 0.2}, {0.5, 0.1, -0.15, 0.25, -0.1}};
-  auto d_v       = make_device_vector(pack_cones(v_cones));
-  auto d_offsets = make_device_vector(offsets);
-
-  // H^{-2} v  (single kernel)
-  rmm::device_uvector<f_t> d_hinv2(cones.omega.size(), stream_);
-  launch_apply_hinv2(
-    d_v, d_hinv2, cones.w_bar, cones.inv_eta, d_offsets, static_cast<i_t>(dims.size()));
-
-  // H^{-1}(H^{-1} v)  (two passes)
-  rmm::device_uvector<f_t> d_tmp(cones.omega.size(), stream_);
-  rmm::device_uvector<f_t> d_double(cones.omega.size(), stream_);
-  launch_apply_hinv(d_v,
-                    d_tmp,
-                    cones.w_bar,
-                    cones.inv_eta,
-                    cones.inv_1pw0,
-                    d_offsets,
-                    static_cast<i_t>(dims.size()));
-  launch_apply_hinv(d_tmp,
-                    d_double,
-                    cones.w_bar,
-                    cones.inv_eta,
-                    cones.inv_1pw0,
-                    d_offsets,
-                    static_cast<i_t>(dims.size()));
-
-  auto hinv2_actual  = copy_to_host(d_hinv2);
-  auto double_actual = copy_to_host(d_double);
-  expect_vector_near(hinv2_actual, double_actual, 1e-10, 1e-8, "hinv2_vs_double_hinv");
-}
-
-TEST_F(second_order_cone_test, apply_hinv2_strided_loop_for_large_cone)
-{
-  std::vector<i_t> dims{513};
-  auto offsets = build_offsets(dims);
-
-  auto s_cone      = make_patterned_cone<f_t>(dims[0], 5.0, 0.005);
-  auto lambda_cone = make_patterned_cone<f_t>(dims[0], 4.0, 0.004);
-
-  auto d_s      = make_device_vector(s_cone);
-  auto d_lambda = make_device_vector(lambda_cone);
-  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
-
-  launch_nt_scaling(cones, stream_);
-
-  auto v_cone    = make_patterned_cone<f_t>(dims[0], 3.0, 0.006);
-  auto d_v       = make_device_vector(v_cone);
-  auto d_offsets = make_device_vector(offsets);
-
-  // Direct H^{-2} apply
-  rmm::device_uvector<f_t> d_hinv2(cones.omega.size(), stream_);
-  launch_apply_hinv2(d_v, d_hinv2, cones.w_bar, cones.inv_eta, d_offsets, 1);
-
-  // Reference: two H^{-1} passes
-  rmm::device_uvector<f_t> d_tmp(cones.omega.size(), stream_);
-  rmm::device_uvector<f_t> d_double(cones.omega.size(), stream_);
-  launch_apply_hinv(d_v, d_tmp, cones.w_bar, cones.inv_eta, cones.inv_1pw0, d_offsets, 1);
-  launch_apply_hinv(d_tmp, d_double, cones.w_bar, cones.inv_eta, cones.inv_1pw0, d_offsets, 1);
-
-  auto hinv2_actual  = copy_to_host(d_hinv2);
-  auto double_actual = copy_to_host(d_double);
-  expect_vector_near(hinv2_actual, double_actual, 1e-8, 1e-6, "hinv2_large");
-
-  // Also check against CPU reference
-  auto w_bar_host   = copy_to_host(cones.w_bar);
-  auto inv_eta_host = copy_to_host(cones.inv_eta);
-  auto ref          = ref_apply_hinv2_single(v_cone, w_bar_host, inv_eta_host[0]);
-  expect_vector_near(hinv2_actual, ref, 1e-8, 1e-6, "hinv2_large_ref");
 }
 
 TEST_F(second_order_cone_test, affine_cone_rhs_matches_hinv2_of_primal)
@@ -1310,168 +1242,6 @@ TEST_F(second_order_cone_test, scatter_hinv2_into_augmented_large_cone)
   }
 }
 
-TEST_F(second_order_cone_test, jordan_product_matches_reference_for_packed_cones)
-{
-  std::vector<i_t> dims{1, 3, 4};
-  auto offsets = build_offsets(dims);
-
-  std::vector<std::vector<f_t>> a_cones{{2.0}, {2.0, 1.0, -0.5}, {3.0, 0.25, -0.75, 0.5}};
-  std::vector<std::vector<f_t>> b_cones{{4.0}, {1.5, -0.5, 0.25}, {2.0, -0.25, 0.5, 1.0}};
-
-  auto a         = make_device_vector(pack_cones(a_cones));
-  auto b         = make_device_vector(pack_cones(b_cones));
-  auto d_offsets = make_device_vector(offsets);
-  rmm::device_uvector<f_t> out(a.size(), stream_);
-
-  launch_jordan_product(a, b, out, d_offsets, static_cast<i_t>(dims.size()));
-
-  auto actual = copy_to_host(out);
-  auto expected =
-    pack_cones(std::vector<std::vector<f_t>>{ref_jordan_product_single(a_cones[0], b_cones[0]),
-                                             ref_jordan_product_single(a_cones[1], b_cones[1]),
-                                             ref_jordan_product_single(a_cones[2], b_cones[2])});
-
-  expect_vector_near(actual, expected, 1e-12, 1e-10, "jordan_product");
-}
-
-TEST_F(second_order_cone_test, inverse_jordan_product_matches_reference_and_identity)
-{
-  std::vector<i_t> dims{1, 3, 5};
-  auto offsets = build_offsets(dims);
-
-  std::vector<std::vector<f_t>> omega_cones{
-    {2.0}, {2.0, 0.5, 0.25}, {3.0, 0.25, -0.5, 0.75, -0.25}};
-  std::vector<std::vector<f_t>> r_cones{{4.0}, {1.0, -0.25, 0.5}, {2.0, 0.5, -0.25, 0.25, 0.75}};
-
-  std::vector<f_t> rho_host;
-  for (const auto& w : omega_cones) {
-    rho_host.push_back(j_norm_sq(w));
-  }
-
-  auto d_omega   = make_device_vector(pack_cones(omega_cones));
-  auto d_r       = make_device_vector(pack_cones(r_cones));
-  auto d_rho     = make_device_vector(rho_host);
-  auto d_offsets = make_device_vector(offsets);
-  rmm::device_uvector<f_t> d_out(d_omega.size(), stream_);
-
-  launch_inverse_jordan_product(
-    d_omega, d_r, d_rho, d_out, d_offsets, static_cast<i_t>(dims.size()));
-
-  auto actual   = copy_to_host(d_out);
-  auto expected = pack_cones(std::vector<std::vector<f_t>>{
-    ref_inverse_jordan_product_single(omega_cones[0], r_cones[0], rho_host[0]),
-    ref_inverse_jordan_product_single(omega_cones[1], r_cones[1], rho_host[1]),
-    ref_inverse_jordan_product_single(omega_cones[2], r_cones[2], rho_host[2])});
-
-  expect_vector_near(actual, expected, 1e-12, 1e-10, "inverse_jordan_product");
-
-  // Identity check: omega circ (omega \ r) = r
-  auto d_inv = make_device_vector(actual);
-  rmm::device_uvector<f_t> d_roundtrip(d_omega.size(), stream_);
-  launch_jordan_product(d_omega, d_inv, d_roundtrip, d_offsets, static_cast<i_t>(dims.size()));
-
-  auto roundtrip = copy_to_host(d_roundtrip);
-  auto r_packed  = pack_cones(r_cones);
-  expect_vector_near(roundtrip, r_packed, 1e-10, 1e-8, "inverse_identity");
-}
-
-TEST_F(second_order_cone_test, jordan_and_inverse_jordan_strided_loop_for_large_cone)
-{
-  std::vector<i_t> dims{513};
-  auto offsets = build_offsets(dims);
-
-  auto a_cone     = make_patterned_cone<f_t>(dims[0], 5.0, 0.005);
-  auto b_cone     = make_patterned_cone<f_t>(dims[0], 4.0, 0.004);
-  auto omega_cone = make_patterned_cone<f_t>(dims[0], 6.0, 0.003);
-  f_t rho_val     = j_norm_sq(omega_cone);
-  ASSERT_GT(rho_val, 0.0);
-
-  std::vector<std::vector<f_t>> a_cones{a_cone};
-  std::vector<std::vector<f_t>> b_cones{b_cone};
-  std::vector<std::vector<f_t>> omega_cones{omega_cone};
-
-  auto d_a       = make_device_vector(pack_cones(a_cones));
-  auto d_b       = make_device_vector(pack_cones(b_cones));
-  auto d_omega   = make_device_vector(pack_cones(omega_cones));
-  auto d_rho     = make_device_vector(std::vector<f_t>{rho_val});
-  auto d_offsets = make_device_vector(offsets);
-
-  // Jordan product: strided path
-  rmm::device_uvector<f_t> d_jp(d_a.size(), stream_);
-  launch_jordan_product(d_a, d_b, d_jp, d_offsets, 1);
-  auto jp_actual   = copy_to_host(d_jp);
-  auto jp_expected = ref_jordan_product_single(a_cone, b_cone);
-  expect_vector_near(jp_actual, jp_expected, 1e-10, 1e-8, "jordan_large");
-
-  // Inverse Jordan product: strided path + identity
-  auto r_cone = make_patterned_cone<f_t>(dims[0], 3.0, 0.006);
-  std::vector<std::vector<f_t>> r_cones{r_cone};
-
-  auto d_r = make_device_vector(pack_cones(r_cones));
-  rmm::device_uvector<f_t> d_inv(d_omega.size(), stream_);
-  launch_inverse_jordan_product(d_omega, d_r, d_rho, d_inv, d_offsets, 1);
-
-  auto inv_actual   = copy_to_host(d_inv);
-  auto inv_expected = ref_inverse_jordan_product_single(omega_cone, r_cone, rho_val);
-  expect_vector_near(inv_actual, inv_expected, 1e-10, 1e-8, "inv_jordan_large");
-
-  // Round-trip identity on the large cone
-  auto d_inv_vec = make_device_vector(inv_actual);
-  rmm::device_uvector<f_t> d_rt(d_omega.size(), stream_);
-  launch_jordan_product(d_omega, d_inv_vec, d_rt, d_offsets, 1);
-  auto rt_actual = copy_to_host(d_rt);
-  expect_vector_near(rt_actual, r_cone, 1e-8, 1e-6, "identity_large");
-}
-
-TEST_F(second_order_cone_test, inverse_jordan_product_with_nt_scaling_rho)
-{
-  std::vector<std::vector<f_t>> s_cones{{2.0, 0.5, 0.25}, {3.0, 0.25, -0.5, 0.75, -0.25}};
-  std::vector<std::vector<f_t>> lambda_cones{{1.5, -0.25, 0.1}, {2.5, -0.1, 0.3, -0.2, 0.15}};
-  std::vector<i_t> dims{3, 5};
-  auto offsets = build_offsets(dims);
-
-  auto d_s      = make_device_vector(pack_cones(s_cones));
-  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
-  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()),
-                              dims,
-                              cuopt::make_span(d_s),
-                              cuopt::make_span(d_lambda),
-                              stream_);
-
-  launch_nt_scaling(cones, stream_);
-
-  auto omega_host = copy_to_host(cones.omega);
-  auto rho_host   = copy_to_host(cones.rho);
-
-  // Build an arbitrary r vector, run inverse Jordan with NT-produced rho/omega
-  std::vector<std::vector<f_t>> r_cones{{1.0, -0.3, 0.2}, {0.5, 0.1, -0.15, 0.25, -0.1}};
-  auto d_r       = make_device_vector(pack_cones(r_cones));
-  auto d_offsets = make_device_vector(offsets);
-  rmm::device_uvector<f_t> d_out(cones.omega.size(), stream_);
-
-  launch_inverse_jordan_product(
-    cones.omega, d_r, cones.rho, d_out, d_offsets, static_cast<i_t>(dims.size()));
-
-  auto inv_actual = copy_to_host(d_out);
-
-  // Verify host reference matches using NT-produced values
-  for (i_t c = 0; c < static_cast<i_t>(dims.size()); ++c) {
-    auto omega_c = slice_cone(omega_host, offsets, c);
-    auto r_c     = r_cones[c];
-    auto ref     = ref_inverse_jordan_product_single(omega_c, r_c, rho_host[c]);
-    auto actual  = slice_cone(inv_actual, offsets, c);
-    expect_vector_near(actual, ref, 1e-10, 1e-8, "nt_rho_inv_jordan");
-  }
-
-  // Round-trip identity with NT-produced omega
-  rmm::device_uvector<f_t> d_rt(cones.omega.size(), stream_);
-  auto d_inv = make_device_vector(inv_actual);
-  launch_jordan_product(cones.omega, d_inv, d_rt, d_offsets, static_cast<i_t>(dims.size()));
-  auto rt_actual = copy_to_host(d_rt);
-  auto r_packed  = pack_cones(r_cones);
-  expect_vector_near(rt_actual, r_packed, 1e-8, 1e-6, "nt_identity");
-}
-
 TEST_F(second_order_cone_test, fused_corrector_matches_reference_with_nt_scaling)
 {
   std::vector<std::vector<f_t>> s_cones{{2.0, 0.5, 0.25}, {3.0, 0.25, -0.5, 0.75, -0.25}};
@@ -1595,7 +1365,7 @@ TEST_F(second_order_cone_test, cone_block_scatter_with_q_overlap)
   }
 }
 
-TEST_F(second_order_cone_test, recover_cone_dz_matches_reference)
+TEST_F(second_order_cone_test, recover_cone_dz_from_target_matches_reference)
 {
   std::vector<std::vector<f_t>> s_cones{{2.0, 0.5, 0.25}, {3.0, 0.25, -0.5, 0.75, -0.25}};
   std::vector<std::vector<f_t>> lambda_cones{{1.5, -0.25, 0.1}, {2.5, -0.1, 0.3, -0.2, 0.15}};
@@ -1615,13 +1385,19 @@ TEST_F(second_order_cone_test, recover_cone_dz_matches_reference)
 
   rmm::device_uvector<f_t> d_rhs(cones.m_c, stream_);
   launch_affine_cone_rhs(cones, d_rhs);
+  auto rhs_actual = copy_to_host(d_rhs);
+
+  std::vector<f_t> target_host(rhs_actual.size(), f_t(0));
+  for (std::size_t j = 0; j < rhs_actual.size(); ++j) {
+    target_host[j] = -rhs_actual[j];
+  }
+  auto d_target = make_device_vector(target_host);
 
   rmm::device_uvector<f_t> d_hinv2_dx(cones.m_c, stream_);
   rmm::device_uvector<f_t> d_dz(cones.m_c, stream_);
-  launch_recover_cone_dz(d_dx, cones, d_rhs, d_hinv2_dx, d_dz);
+  launch_recover_cone_dz_from_target(d_dx, cones, d_target, d_hinv2_dx, d_dz);
 
   auto actual     = copy_to_host(d_dz);
-  auto rhs_actual = copy_to_host(d_rhs);
   auto w_bar_host = copy_to_host(cones.w_bar);
   auto inv_eta_h  = copy_to_host(cones.inv_eta);
 
@@ -1634,7 +1410,7 @@ TEST_F(second_order_cone_test, recover_cone_dz_matches_reference)
     for (i_t j = 0; j < static_cast<i_t>(ref.size()); ++j) {
       ref[j] = -rhs_c[j] - ref_hinv2[j];
     }
-    expect_vector_near(act, ref, 1e-10, 1e-8, "recover_cone_dz");
+    expect_vector_near(act, ref, 1e-10, 1e-8, "recover_cone_dz_from_target");
   }
 }
 

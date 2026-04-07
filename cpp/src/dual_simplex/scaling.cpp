@@ -22,7 +22,7 @@ i_t column_scaling(const lp_problem_t<i_t, f_t>& unscaled,
   i_t m  = scaled.num_rows;
   i_t n  = scaled.num_cols;
 
-  if (!settings.scale_columns || unscaled.Q.n > 0) {
+  if (!settings.scale_columns || unscaled.Q.n > 0 || !unscaled.second_order_cone_dims.empty()) {
     settings.log.printf("Skipping column scaling\n");
     column_scaling.resize(n, 1.0);
     return 0;
@@ -30,19 +30,9 @@ i_t column_scaling(const lp_problem_t<i_t, f_t>& unscaled,
 
   column_scaling.resize(n);
 
-  i_t cone_start = unscaled.cone_var_start;
-  i_t cone_end   = cone_start;
-  for (auto q_k : unscaled.second_order_cone_dims) {
-    cone_end += q_k;
-  }
-
   f_t max = 0;
   f_t min = std::numeric_limits<f_t>::max();
   for (i_t j = 0; j < n; ++j) {
-    if (j >= cone_start && j < cone_end) {
-      column_scaling[j] = 1.0;
-      continue;
-    }
     const i_t col_start = scaled.A.col_start[j];
     const i_t col_end   = scaled.A.col_start[j + 1];
     f_t sum             = 0.0;
