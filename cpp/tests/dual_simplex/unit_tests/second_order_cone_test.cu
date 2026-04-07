@@ -122,6 +122,24 @@ auto ref_apply_H_single(const std::vector<f_t>& z,
 }
 
 template <typename f_t>
+auto ref_build_hinv2_block_single(const std::vector<f_t>& w_bar, f_t inv_eta) -> std::vector<f_t>
+{
+  std::size_t q = w_bar.size();
+  std::vector<f_t> block(q * q, f_t(0));
+  f_t ie_sq = inv_eta * inv_eta;
+
+  for (std::size_t r = 0; r < q; ++r) {
+    f_t u_r = (r == 0) ? w_bar[0] : -w_bar[r];
+    for (std::size_t c = 0; c < q; ++c) {
+      f_t u_c          = (c == 0) ? w_bar[0] : -w_bar[c];
+      f_t j_rc         = (r == c) ? ((r == 0) ? f_t(1) : f_t(-1)) : f_t(0);
+      block[r * q + c] = ie_sq * (f_t(2) * u_r * u_c - j_rc);
+    }
+  }
+  return block;
+}
+
+template <typename f_t>
 auto ref_apply_hinv2_single(const std::vector<f_t>& v, const std::vector<f_t>& w_bar, f_t inv_eta)
   -> std::vector<f_t>
 {
@@ -391,8 +409,13 @@ class second_order_cone_test : public ::testing::Test {
                          const rmm::device_uvector<i_t>& cone_offsets,
                          i_t k)
   {
-    apply_Hinv_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(
-      z.data(), out.data(), w_bar.data(), inv_eta.data(), inv_1pw0.data(), cone_offsets.data(), k);
+    apply_Hinv_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(z),
+                                                             cuopt::make_span(out),
+                                                             cuopt::make_span(w_bar),
+                                                             cuopt::make_span(inv_eta),
+                                                             cuopt::make_span(inv_1pw0),
+                                                             cuopt::make_span(cone_offsets),
+                                                             k);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
     sync();
   }
@@ -406,12 +429,12 @@ class second_order_cone_test : public ::testing::Test {
                           i_t k,
                           f_t alpha_max)
   {
-    step_length_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(s.data(),
-                                                              ds.data(),
-                                                              lambda.data(),
-                                                              dlambda.data(),
-                                                              alpha.data(),
-                                                              cone_offsets.data(),
+    step_length_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(s),
+                                                              cuopt::make_span(ds),
+                                                              cuopt::make_span(lambda),
+                                                              cuopt::make_span(dlambda),
+                                                              cuopt::make_span(alpha),
+                                                              cuopt::make_span(cone_offsets),
                                                               k,
                                                               alpha_max);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
@@ -422,7 +445,8 @@ class second_order_cone_test : public ::testing::Test {
                              const rmm::device_uvector<i_t>& cone_offsets,
                              i_t k)
   {
-    interior_shift_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(u.data(), cone_offsets.data(), k);
+    interior_shift_kernel<i_t, f_t, dim>
+      <<<k, dim, 0, stream_>>>(cuopt::make_span(u), cuopt::make_span(cone_offsets), k);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
     sync();
   }
@@ -434,8 +458,12 @@ class second_order_cone_test : public ::testing::Test {
                           const rmm::device_uvector<i_t>& cone_offsets,
                           i_t k)
   {
-    apply_Hinv2_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(
-      v.data(), out.data(), w_bar.data(), inv_eta.data(), cone_offsets.data(), k);
+    apply_Hinv2_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(v),
+                                                              cuopt::make_span(out),
+                                                              cuopt::make_span(w_bar),
+                                                              cuopt::make_span(inv_eta),
+                                                              cuopt::make_span(cone_offsets),
+                                                              k);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
     sync();
   }
@@ -446,8 +474,11 @@ class second_order_cone_test : public ::testing::Test {
                              const rmm::device_uvector<i_t>& cone_offsets,
                              i_t k)
   {
-    jordan_product_kernel<i_t, f_t, dim>
-      <<<k, dim, 0, stream_>>>(a.data(), b.data(), out.data(), cone_offsets.data(), k);
+    jordan_product_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(a),
+                                                                 cuopt::make_span(b),
+                                                                 cuopt::make_span(out),
+                                                                 cuopt::make_span(cone_offsets),
+                                                                 k);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
     sync();
   }
@@ -459,8 +490,13 @@ class second_order_cone_test : public ::testing::Test {
                                      const rmm::device_uvector<i_t>& cone_offsets,
                                      i_t k)
   {
-    inverse_jordan_product_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(
-      omega.data(), r.data(), rho.data(), out.data(), cone_offsets.data(), k);
+    inverse_jordan_product_kernel<i_t, f_t, dim>
+      <<<k, dim, 0, stream_>>>(cuopt::make_span(omega),
+                               cuopt::make_span(r),
+                               cuopt::make_span(rho),
+                               cuopt::make_span(out),
+                               cuopt::make_span(cone_offsets),
+                               k);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
     sync();
   }
@@ -476,17 +512,26 @@ class second_order_cone_test : public ::testing::Test {
                               const rmm::device_uvector<i_t>& cone_offsets,
                               i_t k)
   {
-    fused_corrector_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(dx_aff.data(),
-                                                                  omega.data(),
-                                                                  w_bar.data(),
-                                                                  inv_eta.data(),
-                                                                  inv_1pw0.data(),
-                                                                  rho.data(),
+    fused_corrector_kernel<i_t, f_t, dim><<<k, dim, 0, stream_>>>(cuopt::make_span(dx_aff),
+                                                                  cuopt::make_span(omega),
+                                                                  cuopt::make_span(w_bar),
+                                                                  cuopt::make_span(inv_eta),
+                                                                  cuopt::make_span(inv_1pw0),
+                                                                  cuopt::make_span(rho),
                                                                   sigma_mu,
-                                                                  out.data(),
-                                                                  cone_offsets.data(),
+                                                                  cuopt::make_span(out),
+                                                                  cuopt::make_span(cone_offsets),
                                                                   k);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
+    sync();
+  }
+
+  void launch_cone_block_scatter(const cone_data_t<i_t, f_t>& cones,
+                                 rmm::device_uvector<f_t>& aug_x,
+                                 const rmm::device_uvector<i_t>& csr_indices,
+                                 const rmm::device_uvector<f_t>& q_values)
+  {
+    scatter_hinv2_into_augmented(cones, aug_x, csr_indices, q_values, stream_);
     sync();
   }
 };
@@ -494,7 +539,7 @@ class second_order_cone_test : public ::testing::Test {
 TEST_F(second_order_cone_test, cone_data_topology_and_bucket_partitioning)
 {
   std::vector<i_t> dims{1, 32, 33, 2048, 2049};
-  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()), dims, stream_);
+  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()), dims, {}, {}, stream_);
 
   auto expected_offsets = build_offsets(dims);
   auto actual_offsets   = copy_to_host(cones.cone_offsets);
@@ -520,9 +565,9 @@ TEST_F(second_order_cone_test, nt_scaling_matches_reference_for_small_cone)
   std::vector<std::vector<f_t>> lambda_cones{{2.0, 0.5, 0.5}};
   std::vector<i_t> dims{3};
 
-  cone_data_t<i_t, f_t> cones(1, dims, stream_);
-  copy_to_device(cones.s, pack_cones(s_cones));
-  copy_to_device(cones.lambda, pack_cones(lambda_cones));
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -558,9 +603,13 @@ TEST_F(second_order_cone_test, nt_scaling_matches_reference_across_bucket_sizes)
   std::vector<i_t> dims{1, 33, 2049};
   auto offsets = build_offsets(dims);
 
-  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()), dims, stream_);
-  copy_to_device(cones.s, pack_cones(s_cones));
-  copy_to_device(cones.lambda, pack_cones(lambda_cones));
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()),
+                              dims,
+                              cuopt::make_span(d_s),
+                              cuopt::make_span(d_lambda),
+                              stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -595,9 +644,9 @@ TEST_F(second_order_cone_test, nt_scaling_omega_equals_H_times_lambda)
   std::vector<std::vector<f_t>> lambda_cones{{4.0, 0.5, 1.0, -0.3, 0.2}};
   std::vector<i_t> dims{5};
 
-  cone_data_t<i_t, f_t> cones(1, dims, stream_);
-  copy_to_device(cones.s, pack_cones(s_cones));
-  copy_to_device(cones.lambda, pack_cones(lambda_cones));
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -618,9 +667,9 @@ TEST_F(second_order_cone_test, nt_scaling_near_boundary_is_stable)
   std::vector<std::vector<f_t>> lambda_cones{{1.000015, 0.8, 0.6, -3e-5, 2e-5}};
   std::vector<i_t> dims{5};
 
-  cone_data_t<i_t, f_t> cones(1, dims, stream_);
-  copy_to_device(cones.s, pack_cones(s_cones));
-  copy_to_device(cones.lambda, pack_cones(lambda_cones));
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -947,9 +996,13 @@ TEST_F(second_order_cone_test, apply_hinv2_equals_double_hinv_with_nt_scaling)
   std::vector<i_t> dims{3, 5};
   auto offsets = build_offsets(dims);
 
-  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()), dims, stream_);
-  copy_to_device(cones.s, pack_cones(s_cones));
-  copy_to_device(cones.lambda, pack_cones(lambda_cones));
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()),
+                              dims,
+                              cuopt::make_span(d_s),
+                              cuopt::make_span(d_lambda),
+                              stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -993,9 +1046,9 @@ TEST_F(second_order_cone_test, apply_hinv2_strided_loop_for_large_cone)
   auto s_cone      = make_patterned_cone<f_t>(dims[0], 5.0, 0.005);
   auto lambda_cone = make_patterned_cone<f_t>(dims[0], 4.0, 0.004);
 
-  cone_data_t<i_t, f_t> cones(1, dims, stream_);
-  copy_to_device(cones.s, s_cone);
-  copy_to_device(cones.lambda, lambda_cone);
+  auto d_s      = make_device_vector(s_cone);
+  auto d_lambda = make_device_vector(lambda_cone);
+  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -1022,6 +1075,159 @@ TEST_F(second_order_cone_test, apply_hinv2_strided_loop_for_large_cone)
   auto inv_eta_host = copy_to_host(cones.inv_eta);
   auto ref          = ref_apply_hinv2_single(v_cone, w_bar_host, inv_eta_host[0]);
   expect_vector_near(hinv2_actual, ref, 1e-8, 1e-6, "hinv2_large_ref");
+}
+
+TEST_F(second_order_cone_test, scatter_hinv2_into_augmented_matches_reference_with_nt_scaling)
+{
+  std::vector<std::vector<f_t>> s_cones{{2.0, 0.5, 0.25}, {3.0, 0.25, -0.5, 0.75, -0.25}};
+  std::vector<std::vector<f_t>> lambda_cones{{1.5, -0.25, 0.1}, {2.5, -0.1, 0.3, -0.2, 0.15}};
+  std::vector<i_t> dims{3, 5};
+  auto offsets = build_offsets(dims);
+
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()),
+                              dims,
+                              cuopt::make_span(d_s),
+                              cuopt::make_span(d_lambda),
+                              stream_);
+
+  launch_nt_scaling(cones, stream_);
+
+  auto block_offsets_host = copy_to_host(cones.block_offsets);
+  i_t total_blk           = dims[0] * dims[0] + dims[1] * dims[1];
+  std::vector<f_t> q_vals(total_blk, f_t(0));
+  std::vector<i_t> csr_indices(total_blk);
+  constexpr i_t aug_offset = 2;
+  for (i_t e = 0; e < total_blk; ++e) {
+    csr_indices[e] = aug_offset + (total_blk - 1 - e);
+  }
+  auto d_csr_indices = make_device_vector(csr_indices);
+  auto d_q_values    = make_device_vector(q_vals);
+  rmm::device_uvector<f_t> d_aug_x(total_blk + aug_offset, stream_);
+  RAFT_CUDA_TRY(
+    cudaMemsetAsync(d_aug_x.data(), 0, sizeof(f_t) * (total_blk + aug_offset), stream_));
+  launch_cone_block_scatter(cones, d_aug_x, d_csr_indices, d_q_values);
+
+  auto actual     = copy_to_host(d_aug_x);
+  auto w_bar_host = copy_to_host(cones.w_bar);
+  auto inv_eta_h  = copy_to_host(cones.inv_eta);
+
+  for (i_t e = 0; e < aug_offset; ++e) {
+    EXPECT_EQ(actual[e], f_t(0)) << "untouched prefix entry " << e;
+  }
+
+  i_t blk_off = 0;
+  for (i_t c = 0; c < static_cast<i_t>(dims.size()); ++c) {
+    auto w_c   = slice_cone(w_bar_host, offsets, c);
+    auto ref   = ref_build_hinv2_block_single(w_c, inv_eta_h[c]);
+    i_t blk_sz = dims[c] * dims[c];
+    for (i_t e = 0; e < blk_sz; ++e) {
+      EXPECT_NEAR(actual[csr_indices[blk_off + e]], -ref[e], 1e-10 + 1e-8 * std::abs(ref[e]))
+        << "cone " << c << " entry " << e;
+    }
+    blk_off += blk_sz;
+  }
+}
+
+TEST_F(second_order_cone_test, scatter_hinv2_into_augmented_matvec_matches_apply_hinv2)
+{
+  std::vector<std::vector<f_t>> s_cones{{5.0, 1.0, -1.0, 0.5, 0.3}};
+  std::vector<std::vector<f_t>> lambda_cones{{4.0, 0.5, 1.0, -0.3, 0.2}};
+  std::vector<i_t> dims{5};
+  i_t q = dims[0];
+
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
+
+  launch_nt_scaling(cones, stream_);
+
+  i_t total_blk = q * q;
+  std::vector<i_t> csr_indices(total_blk);
+  std::iota(csr_indices.begin(), csr_indices.end(), 0);
+  std::vector<f_t> q_vals(total_blk, f_t(0));
+  auto d_csr_indices = make_device_vector(csr_indices);
+  auto d_q_values    = make_device_vector(q_vals);
+  rmm::device_uvector<f_t> d_aug_x(total_blk, stream_);
+  RAFT_CUDA_TRY(cudaMemsetAsync(d_aug_x.data(), 0, sizeof(f_t) * total_blk, stream_));
+  launch_cone_block_scatter(cones, d_aug_x, d_csr_indices, d_q_values);
+
+  auto scattered = copy_to_host(d_aug_x);
+  std::vector<f_t> block(total_blk);
+  for (i_t e = 0; e < total_blk; ++e) {
+    block[e] = -scattered[e];
+  }
+
+  std::vector<std::vector<f_t>> test_vectors{
+    {1.0, 0.0, 0.0, 0.0, 0.0}, {0.0, 1.0, 0.0, 0.0, 0.0}, {0.3, -0.1, 0.2, -0.5, 0.15}};
+
+  auto w_bar_host = copy_to_host(cones.w_bar);
+  auto inv_eta_h  = copy_to_host(cones.inv_eta);
+
+  for (const auto& v : test_vectors) {
+    // Host mat-vec: y = block * v
+    std::vector<f_t> y(q, f_t(0));
+    for (i_t r = 0; r < q; ++r) {
+      for (i_t c = 0; c < q; ++c) {
+        y[r] += block[r * q + c] * v[c];
+      }
+    }
+
+    auto ref = ref_apply_hinv2_single(v, w_bar_host, inv_eta_h[0]);
+    expect_vector_near(y, ref, 1e-10, 1e-8, "block_matvec_vs_apply");
+  }
+}
+
+TEST_F(second_order_cone_test, scatter_hinv2_into_augmented_large_cone)
+{
+  std::vector<i_t> dims{513};
+
+  auto s_cone      = make_patterned_cone<f_t>(dims[0], 5.0, 0.005);
+  auto lambda_cone = make_patterned_cone<f_t>(dims[0], 4.0, 0.004);
+
+  auto d_s      = make_device_vector(s_cone);
+  auto d_lambda = make_device_vector(lambda_cone);
+  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
+
+  launch_nt_scaling(cones, stream_);
+
+  i_t total_blk = dims[0] * dims[0];
+  std::vector<i_t> csr_indices(total_blk);
+  std::iota(csr_indices.begin(), csr_indices.end(), 0);
+  std::vector<f_t> q_vals(total_blk, f_t(0));
+  auto d_csr_indices = make_device_vector(csr_indices);
+  auto d_q_values    = make_device_vector(q_vals);
+  rmm::device_uvector<f_t> d_aug_x(total_blk, stream_);
+  RAFT_CUDA_TRY(cudaMemsetAsync(d_aug_x.data(), 0, sizeof(f_t) * total_blk, stream_));
+  launch_cone_block_scatter(cones, d_aug_x, d_csr_indices, d_q_values);
+
+  auto scattered = copy_to_host(d_aug_x);
+  std::vector<f_t> block(total_blk);
+  for (i_t e = 0; e < total_blk; ++e) {
+    block[e] = -scattered[e];
+  }
+  auto w_bar_host = copy_to_host(cones.w_bar);
+  auto inv_eta_h  = copy_to_host(cones.inv_eta);
+
+  // Spot-check: block * e_0 should match apply_Hinv2(e_0)
+  i_t q = dims[0];
+  std::vector<f_t> col0(q);
+  for (i_t r = 0; r < q; ++r) {
+    col0[r] = block[r * q];
+  }
+  std::vector<f_t> e0(q, f_t(0));
+  e0[0]    = f_t(1);
+  auto ref = ref_apply_hinv2_single(e0, w_bar_host, inv_eta_h[0]);
+  expect_vector_near(col0, ref, 1e-8, 1e-6, "hinv2_block_col0_large");
+
+  // Symmetry check: block[r][c] == block[c][r]
+  for (i_t r = 0; r < std::min(q, i_t(50)); ++r) {
+    for (i_t c = r + 1; c < std::min(q, i_t(50)); ++c) {
+      EXPECT_NEAR(block[r * q + c], block[c * q + r], 1e-10)
+        << "asymmetry at (" << r << "," << c << ")";
+    }
+  }
 }
 
 TEST_F(second_order_cone_test, jordan_product_matches_reference_for_packed_cones)
@@ -1144,9 +1350,13 @@ TEST_F(second_order_cone_test, inverse_jordan_product_with_nt_scaling_rho)
   std::vector<i_t> dims{3, 5};
   auto offsets = build_offsets(dims);
 
-  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()), dims, stream_);
-  copy_to_device(cones.s, pack_cones(s_cones));
-  copy_to_device(cones.lambda, pack_cones(lambda_cones));
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()),
+                              dims,
+                              cuopt::make_span(d_s),
+                              cuopt::make_span(d_lambda),
+                              stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -1189,9 +1399,13 @@ TEST_F(second_order_cone_test, fused_corrector_matches_reference_with_nt_scaling
   std::vector<i_t> dims{3, 5};
   auto offsets = build_offsets(dims);
 
-  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()), dims, stream_);
-  copy_to_device(cones.s, pack_cones(s_cones));
-  copy_to_device(cones.lambda, pack_cones(lambda_cones));
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(static_cast<i_t>(dims.size()),
+                              dims,
+                              cuopt::make_span(d_s),
+                              cuopt::make_span(d_lambda),
+                              stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -1241,9 +1455,9 @@ TEST_F(second_order_cone_test, fused_corrector_strided_loop_for_large_cone)
   auto s_cone      = make_patterned_cone<f_t>(dims[0], 5.0, 0.005);
   auto lambda_cone = make_patterned_cone<f_t>(dims[0], 4.0, 0.004);
 
-  cone_data_t<i_t, f_t> cones(1, dims, stream_);
-  copy_to_device(cones.s, s_cone);
-  copy_to_device(cones.lambda, lambda_cone);
+  auto d_s      = make_device_vector(s_cone);
+  auto d_lambda = make_device_vector(lambda_cone);
+  cone_data_t<i_t, f_t> cones(1, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
 
   launch_nt_scaling(cones, stream_);
 
@@ -1275,6 +1489,50 @@ TEST_F(second_order_cone_test, fused_corrector_strided_loop_for_large_cone)
   auto ref = ref_fused_corrector_single(
     dx_aff_cone, omega_host, w_bar_host, inv_eta_h[0], inv_1pw0_h[0], rho_h[0], sigma_mu);
   expect_vector_near(actual, ref, 1e-8, 1e-6, "fused_corrector_large");
+}
+
+TEST_F(second_order_cone_test, cone_block_scatter_with_q_overlap)
+{
+  std::vector<std::vector<f_t>> s_cones{{3.0, 0.5, -0.3}};
+  std::vector<std::vector<f_t>> lambda_cones{{2.0, -0.2, 0.4}};
+  std::vector<i_t> dims{3};
+  i_t K               = 1;
+  i_t q_k             = 3;
+  i_t total_block_nnz = q_k * q_k;
+
+  auto d_s      = make_device_vector(pack_cones(s_cones));
+  auto d_lambda = make_device_vector(pack_cones(lambda_cones));
+  cone_data_t<i_t, f_t> cones(K, dims, cuopt::make_span(d_s), cuopt::make_span(d_lambda), stream_);
+  launch_nt_scaling(cones, stream_);
+
+  f_t dual_perturb = 1e-6;
+  std::vector<f_t> q_vals(total_block_nnz, f_t(0));
+  q_vals[0] = 0.5 + dual_perturb;
+  q_vals[4] = 0.3 + dual_perturb;
+  q_vals[8] = 0.1 + dual_perturb;
+  q_vals[1] = 0.05;
+  q_vals[3] = 0.05;
+
+  std::vector<i_t> cone_csr_indices(total_block_nnz);
+  std::iota(cone_csr_indices.begin(), cone_csr_indices.end(), 0);
+  auto d_cone_csr_indices = make_device_vector(cone_csr_indices);
+  auto d_cone_Q_values    = make_device_vector(q_vals);
+
+  rmm::device_uvector<f_t> d_aug_x(total_block_nnz, stream_);
+  RAFT_CUDA_TRY(cudaMemsetAsync(d_aug_x.data(), 0, sizeof(f_t) * total_block_nnz, stream_));
+
+  launch_cone_block_scatter(cones, d_aug_x, d_cone_csr_indices, d_cone_Q_values);
+
+  auto actual    = copy_to_host(d_aug_x);
+  auto w_bar_h   = copy_to_host(cones.w_bar);
+  auto inv_eta_h = copy_to_host(cones.inv_eta);
+  auto ref_block = ref_build_hinv2_block_single(w_bar_h, inv_eta_h[0]);
+
+  for (i_t e = 0; e < total_block_nnz; ++e) {
+    f_t expected = -ref_block[e] - q_vals[e];
+    EXPECT_NEAR(actual[e], expected, 1e-10 + 1e-8 * std::abs(expected))
+      << "entry " << e << " (Q overlap test)";
+  }
 }
 
 }  // namespace cuopt::linear_programming::dual_simplex::test

@@ -12,12 +12,18 @@
 
 #include <rmm/device_uvector.hpp>
 
+#include <raft/core/device_span.hpp>
 #include <raft/util/cudart_utils.hpp>
 
 #include <cuda/std/tuple>
 
 #include <cub/block/block_reduce.cuh>
 
+#include <rmm/exec_policy.hpp>
+
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/scatter.h>
 #include <algorithm>
 #include <numeric>
 #include <type_traits>
@@ -135,24 +141,25 @@ DI triplet_t<f_t> reduce_broadcast(triplet_t<f_t> val, smem_warp_reduce_t<f_t, B
 // H^{-1}z = (1/η)(w̄₀z₀ − ζ,  z₁ + (−z₀ + ζ/(1+w̄₀))w̄₁),  ζ = w̄₁ᵀz₁
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void apply_Hinv_kernel(const f_t* __restrict__ z,
-                                                               f_t* __restrict__ out,
-                                                               const f_t* __restrict__ w_bar,
-                                                               const f_t* __restrict__ inv_eta,
-                                                               const f_t* __restrict__ inv_1pw0,
-                                                               const i_t* __restrict__ cone_offsets,
-                                                               i_t K)
+__global__ __launch_bounds__(BLOCK_DIM) void apply_Hinv_kernel(
+  raft::device_span<const f_t> z,
+  raft::device_span<f_t> out,
+  raft::device_span<const f_t> w_bar,
+  raft::device_span<const f_t> inv_eta,
+  raft::device_span<const f_t> inv_1pw0,
+  raft::device_span<const i_t> cone_offsets,
+  i_t K)
 {
   __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
 
   i_t cone = static_cast<i_t>(blockIdx.x);
   if (cone >= K) return;
 
-  i_t off           = cone_offsets[cone];
-  i_t q             = cone_offsets[cone + 1] - off;
-  const f_t* w_cone = w_bar + off;
-  const f_t* z_cone = z + off;
-  f_t* out_cone     = out + off;
+  i_t off       = cone_offsets[cone];
+  i_t q         = cone_offsets[cone + 1] - off;
+  auto w_cone   = w_bar.subspan(off, q);
+  auto z_cone   = z.subspan(off, q);
+  auto out_cone = out.subspan(off, q);
 
   f_t z0 = z_cone[0];
   f_t w0 = w_cone[0];
@@ -184,11 +191,11 @@ __global__ __launch_bounds__(BLOCK_DIM) void apply_Hinv_kernel(const f_t* __rest
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t, int BLOCK_DIM>
 __global__ __launch_bounds__(BLOCK_DIM) void apply_Hinv2_kernel(
-  const f_t* __restrict__ v,
-  f_t* __restrict__ out,
-  const f_t* __restrict__ w_bar,
-  const f_t* __restrict__ inv_eta,
-  const i_t* __restrict__ cone_offsets,
+  raft::device_span<const f_t> v,
+  raft::device_span<f_t> out,
+  raft::device_span<const f_t> w_bar,
+  raft::device_span<const f_t> inv_eta,
+  raft::device_span<const i_t> cone_offsets,
   i_t K)
 {
   __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
@@ -196,11 +203,11 @@ __global__ __launch_bounds__(BLOCK_DIM) void apply_Hinv2_kernel(
   i_t cone = static_cast<i_t>(blockIdx.x);
   if (cone >= K) return;
 
-  i_t off           = cone_offsets[cone];
-  i_t q             = cone_offsets[cone + 1] - off;
-  const f_t* w_cone = w_bar + off;
-  const f_t* v_cone = v + off;
-  f_t* out_cone     = out + off;
+  i_t off       = cone_offsets[cone];
+  i_t q         = cone_offsets[cone + 1] - off;
+  auto w_cone   = w_bar.subspan(off, q);
+  auto v_cone   = v.subspan(off, q);
+  auto out_cone = out.subspan(off, q);
 
   f_t v0 = v_cone[0];
   f_t w0 = w_cone[0];
@@ -237,10 +244,10 @@ __global__ __launch_bounds__(BLOCK_DIM) void apply_Hinv2_kernel(
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t, int BLOCK_DIM>
 __global__ __launch_bounds__(BLOCK_DIM) void jordan_product_kernel(
-  const f_t* __restrict__ a,
-  const f_t* __restrict__ b,
-  f_t* __restrict__ out,
-  const i_t* __restrict__ cone_offsets,
+  raft::device_span<const f_t> a,
+  raft::device_span<const f_t> b,
+  raft::device_span<f_t> out,
+  raft::device_span<const i_t> cone_offsets,
   i_t K)
 {
   __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
@@ -248,11 +255,11 @@ __global__ __launch_bounds__(BLOCK_DIM) void jordan_product_kernel(
   i_t cone = static_cast<i_t>(blockIdx.x);
   if (cone >= K) return;
 
-  i_t off           = cone_offsets[cone];
-  i_t q             = cone_offsets[cone + 1] - off;
-  const f_t* a_cone = a + off;
-  const f_t* b_cone = b + off;
-  f_t* out_cone     = out + off;
+  i_t off       = cone_offsets[cone];
+  i_t q         = cone_offsets[cone + 1] - off;
+  auto a_cone   = a.subspan(off, q);
+  auto b_cone   = b.subspan(off, q);
+  auto out_cone = out.subspan(off, q);
 
   f_t a0 = a_cone[0];
   f_t b0 = b_cone[0];
@@ -280,11 +287,11 @@ __global__ __launch_bounds__(BLOCK_DIM) void jordan_product_kernel(
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t, int BLOCK_DIM>
 __global__ __launch_bounds__(BLOCK_DIM) void inverse_jordan_product_kernel(
-  const f_t* __restrict__ omega,
-  const f_t* __restrict__ r,
-  const f_t* __restrict__ rho,
-  f_t* __restrict__ out,
-  const i_t* __restrict__ cone_offsets,
+  raft::device_span<const f_t> omega,
+  raft::device_span<const f_t> r,
+  raft::device_span<const f_t> rho,
+  raft::device_span<f_t> out,
+  raft::device_span<const i_t> cone_offsets,
   i_t K)
 {
   __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
@@ -292,11 +299,11 @@ __global__ __launch_bounds__(BLOCK_DIM) void inverse_jordan_product_kernel(
   i_t cone = static_cast<i_t>(blockIdx.x);
   if (cone >= K) return;
 
-  i_t off               = cone_offsets[cone];
-  i_t q                 = cone_offsets[cone + 1] - off;
-  const f_t* omega_cone = omega + off;
-  const f_t* r_cone     = r + off;
-  f_t* out_cone         = out + off;
+  i_t off         = cone_offsets[cone];
+  i_t q           = cone_offsets[cone + 1] - off;
+  auto omega_cone = omega.subspan(off, q);
+  auto r_cone     = r.subspan(off, q);
+  auto out_cone   = out.subspan(off, q);
 
   f_t omega_0 = omega_cone[0];
   f_t r_0     = r_cone[0];
@@ -337,15 +344,15 @@ __global__ __launch_bounds__(BLOCK_DIM) void inverse_jordan_product_kernel(
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t, int BLOCK_DIM>
 __global__ __launch_bounds__(BLOCK_DIM) void fused_corrector_kernel(
-  const f_t* __restrict__ dx_aff,
-  const f_t* __restrict__ omega,
-  const f_t* __restrict__ w_bar,
-  const f_t* __restrict__ inv_eta,
-  const f_t* __restrict__ inv_1pw0,
-  const f_t* __restrict__ rho,
+  raft::device_span<const f_t> dx_aff,
+  raft::device_span<const f_t> omega,
+  raft::device_span<const f_t> w_bar,
+  raft::device_span<const f_t> inv_eta,
+  raft::device_span<const f_t> inv_1pw0,
+  raft::device_span<const f_t> rho,
   f_t sigma_mu,
-  f_t* __restrict__ out,
-  const i_t* __restrict__ cone_offsets,
+  raft::device_span<f_t> out,
+  raft::device_span<const i_t> cone_offsets,
   i_t K)
 {
   __shared__ smem_reduce_t<f_t, BLOCK_DIM> smem;
@@ -353,12 +360,12 @@ __global__ __launch_bounds__(BLOCK_DIM) void fused_corrector_kernel(
   i_t cone = static_cast<i_t>(blockIdx.x);
   if (cone >= K) return;
 
-  i_t off               = cone_offsets[cone];
-  i_t q                 = cone_offsets[cone + 1] - off;
-  const f_t* dx_a       = dx_aff + off;
-  const f_t* omega_cone = omega + off;
-  const f_t* w_cone     = w_bar + off;
-  f_t* out_cone         = out + off;
+  i_t off         = cone_offsets[cone];
+  i_t q           = cone_offsets[cone + 1] - off;
+  auto dx_a       = dx_aff.subspan(off, q);
+  auto omega_cone = omega.subspan(off, q);
+  auto w_cone     = w_bar.subspan(off, q);
+  auto out_cone   = out.subspan(off, q);
 
   f_t ie      = inv_eta[cone];
   f_t ipw     = inv_1pw0[cone];
@@ -473,17 +480,18 @@ struct nt_warp_storage {
 };
 
 template <typename i_t, typename f_t, int BLOCK_DIM>
-__global__ __launch_bounds__(BLOCK_DIM) void nt_scaling_kernel(const f_t* __restrict__ s,
-                                                               const f_t* __restrict__ lambda,
-                                                               f_t* __restrict__ eta,
-                                                               f_t* __restrict__ inv_eta,
-                                                               f_t* __restrict__ inv_1pw0,
-                                                               f_t* __restrict__ w_bar,
-                                                               f_t* __restrict__ omega,
-                                                               f_t* __restrict__ rho,
-                                                               const i_t* __restrict__ cone_offsets,
-                                                               const i_t* __restrict__ cone_ids,
-                                                               i_t num_cones)
+__global__ __launch_bounds__(BLOCK_DIM) void nt_scaling_kernel(
+  raft::device_span<const f_t> s,
+  raft::device_span<const f_t> lambda,
+  raft::device_span<f_t> eta,
+  raft::device_span<f_t> inv_eta,
+  raft::device_span<f_t> inv_1pw0,
+  raft::device_span<f_t> w_bar,
+  raft::device_span<f_t> omega,
+  raft::device_span<f_t> rho,
+  raft::device_span<const i_t> cone_offsets,
+  raft::device_span<const i_t> cone_ids,
+  i_t num_cones)
 {
   static_assert(BLOCK_DIM % 32 == 0, "NT scaling kernel requires warp-aligned BLOCK_DIM");
   __shared__ nt_block_storage<f_t, BLOCK_DIM> storage;
@@ -571,16 +579,16 @@ __global__ __launch_bounds__(BLOCK_DIM) void nt_scaling_kernel(const f_t* __rest
 
 template <typename i_t, typename f_t, int BLOCK_DIM>
 __global__ __launch_bounds__(BLOCK_DIM) void nt_scaling_small_kernel(
-  const f_t* __restrict__ s,
-  const f_t* __restrict__ lambda,
-  f_t* __restrict__ eta,
-  f_t* __restrict__ inv_eta,
-  f_t* __restrict__ inv_1pw0,
-  f_t* __restrict__ w_bar,
-  f_t* __restrict__ omega,
-  f_t* __restrict__ rho,
-  const i_t* __restrict__ cone_offsets,
-  const i_t* __restrict__ cone_ids,
+  raft::device_span<const f_t> s,
+  raft::device_span<const f_t> lambda,
+  raft::device_span<f_t> eta,
+  raft::device_span<f_t> inv_eta,
+  raft::device_span<f_t> inv_1pw0,
+  raft::device_span<f_t> w_bar,
+  raft::device_span<f_t> omega,
+  raft::device_span<f_t> rho,
+  raft::device_span<const i_t> cone_offsets,
+  raft::device_span<const i_t> cone_ids,
   i_t num_cones)
 {
   static_assert(BLOCK_DIM % 32 == 0, "Small-cone NT kernel requires warp-aligned CTAs");
@@ -671,12 +679,12 @@ __global__ __launch_bounds__(BLOCK_DIM) void nt_scaling_small_kernel(
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t, int BLOCK_DIM>
 DI f_t
-cone_step_length_single(const f_t* __restrict__ u,
-                        const f_t* __restrict__ du,
-                        i_t q,
+cone_step_length_single(raft::device_span<const f_t> u,
+                        raft::device_span<const f_t> du,
                         typename block_reduce_t<triplet_t<f_t>, BLOCK_DIM>::TempStorage& temp,
                         f_t alpha)
 {
+  i_t q                              = static_cast<i_t>(u.size());
   auto partial                       = triplet_t<f_t>{};
   auto& [du1_sq_p, u1du1_p, u1_sq_p] = partial;
   for (i_t j = 1 + static_cast<i_t>(threadIdx.x); j < q; j += BLOCK_DIM) {
@@ -731,12 +739,12 @@ cone_step_length_single(const f_t* __restrict__ u,
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t, int BLOCK_DIM>
 __global__ __launch_bounds__(BLOCK_DIM) void step_length_kernel(
-  const f_t* __restrict__ s,
-  const f_t* __restrict__ ds,
-  const f_t* __restrict__ lambda,
-  const f_t* __restrict__ dlambda,
-  f_t* __restrict__ alpha,
-  const i_t* __restrict__ cone_offsets,
+  raft::device_span<const f_t> s,
+  raft::device_span<const f_t> ds,
+  raft::device_span<const f_t> lambda,
+  raft::device_span<const f_t> dlambda,
+  raft::device_span<f_t> alpha,
+  raft::device_span<const i_t> cone_offsets,
   i_t K,
   f_t alpha_max)
 {
@@ -748,10 +756,10 @@ __global__ __launch_bounds__(BLOCK_DIM) void step_length_kernel(
   i_t off = cone_offsets[cone];
   i_t q   = cone_offsets[cone + 1] - off;
 
-  f_t alpha_s =
-    cone_step_length_single<i_t, f_t, BLOCK_DIM>(s + off, ds + off, q, temp_storage, alpha_max);
+  f_t alpha_s = cone_step_length_single<i_t, f_t, BLOCK_DIM>(
+    s.subspan(off, q), ds.subspan(off, q), temp_storage, alpha_max);
   f_t alpha_l = cone_step_length_single<i_t, f_t, BLOCK_DIM>(
-    lambda + off, dlambda + off, q, temp_storage, alpha_max);
+    lambda.subspan(off, q), dlambda.subspan(off, q), temp_storage, alpha_max);
 
   if (threadIdx.x == 0) { alpha[cone] = min(alpha_s, alpha_l); }
 }
@@ -766,7 +774,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void step_length_kernel(
 // ---------------------------------------------------------------------------
 template <typename i_t, typename f_t, int BLOCK_DIM>
 __global__ __launch_bounds__(BLOCK_DIM) void interior_shift_kernel(
-  f_t* __restrict__ u, const i_t* __restrict__ cone_offsets, i_t K)
+  raft::device_span<f_t> u, raft::device_span<const i_t> cone_offsets, i_t K)
 {
   __shared__ typename block_reduce_t<f_t, BLOCK_DIM>::TempStorage temp_storage;
 
@@ -791,10 +799,14 @@ __global__ __launch_bounds__(BLOCK_DIM) void interior_shift_kernel(
 }
 
 /**
- * Owns device storage for second-order cone topology, iterates, and NT scaling.
+ * Device storage for second-order cone topology, NT scaling, and iterate views.
  *
  * Flat arrays are packed by cone: elements [cone_offsets[i], cone_offsets[i+1])
  * belong to cone i, which has dimension cone_dims[i].
+ *
+ * Primal/dual iterates (s, lambda) are non-owning spans, pre-sliced by the
+ * caller to cover the cone portion of the global x/z vectors.  The caller
+ * must keep the underlying memory alive.
  *
  * Search directions, RHS vectors, and workspace live directly in
  * iteration_data_t (matching the existing LP/QP pattern where dx_aff, dual_rhs,
@@ -806,12 +818,13 @@ struct cone_data_t {
   i_t K;    // number of second-order cones
   i_t m_c;  // total cone dimension = sum of cone_dims
 
-  rmm::device_uvector<i_t> cone_offsets;  // [K+1] prefix sums of cone_dims
-  rmm::device_uvector<i_t> cone_dims;     // [K]   dimension q_i of each cone
+  rmm::device_uvector<i_t> cone_offsets;   // [K+1] prefix sums of cone_dims
+  rmm::device_uvector<i_t> cone_dims;      // [K]   dimension q_i of each cone
+  rmm::device_uvector<i_t> block_offsets;  // [K+1] prefix sums of q_i^2 (for dense block build)
 
-  // --- Primal/dual cone iterates (rewritten each iteration) ---
-  rmm::device_uvector<f_t> s;       // [m_c] cone slack: s_i in int(Q^{q_i})
-  rmm::device_uvector<f_t> lambda;  // [m_c] cone dual:  lambda_i in int(Q^{q_i})
+  // --- Primal/dual cone iterates (non-owning views, set by caller) ---
+  raft::device_span<f_t> s;       // [m_c] cone slack: s_i in int(Q^{q_i})
+  raft::device_span<f_t> lambda;  // [m_c] cone dual:  lambda_i in int(Q^{q_i})
 
   // --- NT scaling state (recomputed each iteration from s, lambda) ---
   rmm::device_uvector<f_t> eta;  // [K]   scaling factor eta_i = (||s_i||_J / ||lambda_i||_J)^{1/2}
@@ -824,13 +837,18 @@ struct cone_data_t {
   rmm::device_uvector<i_t> medium_cone_ids;  // [n_medium] cone ids with 32 < q <= 2048
   rmm::device_uvector<i_t> large_cone_ids;   // [n_large] cone ids with q > 2048
 
-  cone_data_t(i_t K_in, const std::vector<i_t>& dims, rmm::cuda_stream_view stream)
+  cone_data_t(i_t K_in,
+              const std::vector<i_t>& dims,
+              raft::device_span<f_t> s_in,
+              raft::device_span<f_t> lambda_in,
+              rmm::cuda_stream_view stream)
     : K(K_in),
       m_c(std::accumulate(dims.begin(), dims.end(), i_t(0))),
       cone_offsets(K_in + 1, stream),
       cone_dims(K_in, stream),
-      s(m_c, stream),
-      lambda(m_c, stream),
+      block_offsets(K_in + 1, stream),
+      s(s_in),
+      lambda(lambda_in),
       eta(K_in, stream),
       inv_eta(K_in, stream),
       inv_1pw0(K_in, stream),
@@ -842,12 +860,14 @@ struct cone_data_t {
       large_cone_ids(0, stream)
   {
     std::vector<i_t> offsets(K + 1, 0);
+    std::vector<i_t> blk_offsets(K + 1, 0);
     std::vector<i_t> small_ids;
     std::vector<i_t> medium_ids;
     std::vector<i_t> large_ids;
 
     for (i_t i = 0; i < K; ++i) {
-      offsets[i + 1] = offsets[i] + dims[i];
+      offsets[i + 1]     = offsets[i] + dims[i];
+      blk_offsets[i + 1] = blk_offsets[i] + dims[i] * dims[i];
       if (dims[i] <= small_cone_limit) {
         small_ids.push_back(i);
       } else if (dims[i] <= medium_cone_limit) {
@@ -866,11 +886,75 @@ struct cone_data_t {
 
     raft::copy(cone_offsets.data(), offsets.data(), K + 1, stream);
     raft::copy(cone_dims.data(), dims.data(), K, stream);
+    raft::copy(block_offsets.data(), blk_offsets.data(), K + 1, stream);
     init_device_vec(small_cone_ids, small_ids);
     init_device_vec(medium_cone_ids, medium_ids);
     init_device_vec(large_cone_ids, large_ids);
   }
 };
+
+// ---------------------------------------------------------------------------
+// Compute flat H^{-2} cone-block entries and scatter them into the augmented
+// CSR value array.
+//
+// The caller provides one flat entry per dense cone-block element:
+//   - `csr_indices[e]` gives the destination slot in `augmented_x`
+//   - `q_values[e]` stores any pre-merged Q contribution for that slot
+//
+// For each flat entry we identify its owning cone from `block_offsets`,
+// recover local (r, c) coordinates, evaluate H_k^{-2}(r, c), and scatter
+//   -(H_k^{-2}(r, c) + q_values[e])
+// into `augmented_x[csr_indices[e]]`.
+// ---------------------------------------------------------------------------
+template <typename i_t, typename f_t>
+void scatter_hinv2_into_augmented(const cone_data_t<i_t, f_t>& cones,
+                                  rmm::device_uvector<f_t>& augmented_x,
+                                  const rmm::device_uvector<i_t>& csr_indices,
+                                  const rmm::device_uvector<f_t>& q_values,
+                                  rmm::cuda_stream_view stream)
+{
+  i_t count = static_cast<i_t>(csr_indices.size());
+  if (count == 0) return;
+
+  auto values = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<i_t>(0),
+    [span_w_bar         = cuopt::make_span(cones.w_bar),
+     span_inv_eta       = cuopt::make_span(cones.inv_eta),
+     span_block_offsets = cuopt::make_span(cones.block_offsets),
+     span_cone_offsets  = cuopt::make_span(cones.cone_offsets),
+     span_q_values      = cuopt::make_span(q_values)] __device__(i_t e) -> f_t {
+      i_t lo = 0;
+      i_t hi = static_cast<i_t>(span_block_offsets.size()) - 1;
+      while (lo + 1 < hi) {
+        i_t mid = lo + (hi - lo) / 2;
+        if (span_block_offsets[mid] <= e) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      i_t cone    = lo;
+      i_t off     = span_cone_offsets[cone];
+      i_t q       = span_cone_offsets[cone + 1] - off;
+      i_t blk_off = span_block_offsets[cone];
+      i_t local   = e - blk_off;
+      i_t r       = local / q;
+      i_t c       = local % q;
+
+      f_t ie_sq           = span_inv_eta[cone] * span_inv_eta[cone];
+      f_t w0              = span_w_bar[off];
+      f_t u_r             = (r == 0) ? w0 : -span_w_bar[off + r];
+      f_t u_c             = (c == 0) ? w0 : -span_w_bar[off + c];
+      f_t val             = f_t(2) * u_r * ie_sq * u_c;
+      f_t diag_correction = (r == 0) ? -ie_sq : ie_sq;
+      if (r == c) { val += diag_correction; }
+
+      return -val - span_q_values[e];
+    });
+
+  thrust::scatter(
+    rmm::exec_policy(stream), values, values + count, csr_indices.begin(), augmented_x.begin());
+}
 
 template <typename i_t, typename f_t>
 void launch_nt_scaling(cone_data_t<i_t, f_t>& cones, rmm::cuda_stream_view stream)
@@ -881,16 +965,16 @@ void launch_nt_scaling(cone_data_t<i_t, f_t>& cones, rmm::cuda_stream_view strea
     if (bucket_size == 0) return;
 
     nt_scaling_kernel<i_t, f_t, block_dim>
-      <<<bucket_size, block_dim, 0, stream>>>(cones.s.data(),
-                                              cones.lambda.data(),
-                                              cones.eta.data(),
-                                              cones.inv_eta.data(),
-                                              cones.inv_1pw0.data(),
-                                              cones.w_bar.data(),
-                                              cones.omega.data(),
-                                              cones.rho.data(),
-                                              cones.cone_offsets.data(),
-                                              cone_ids.data(),
+      <<<bucket_size, block_dim, 0, stream>>>(cones.s,
+                                              cones.lambda,
+                                              cuopt::make_span(cones.eta),
+                                              cuopt::make_span(cones.inv_eta),
+                                              cuopt::make_span(cones.inv_1pw0),
+                                              cuopt::make_span(cones.w_bar),
+                                              cuopt::make_span(cones.omega),
+                                              cuopt::make_span(cones.rho),
+                                              cuopt::make_span(cones.cone_offsets),
+                                              cuopt::make_span(cone_ids),
                                               bucket_size);
   };
 
@@ -899,16 +983,16 @@ void launch_nt_scaling(cone_data_t<i_t, f_t>& cones, rmm::cuda_stream_view strea
     constexpr int warps_per_block = small_block_dim / 32;
     i_t grid_dim                  = (small_count + warps_per_block - 1) / warps_per_block;
     nt_scaling_small_kernel<i_t, f_t, small_block_dim>
-      <<<grid_dim, small_block_dim, 0, stream>>>(cones.s.data(),
-                                                 cones.lambda.data(),
-                                                 cones.eta.data(),
-                                                 cones.inv_eta.data(),
-                                                 cones.inv_1pw0.data(),
-                                                 cones.w_bar.data(),
-                                                 cones.omega.data(),
-                                                 cones.rho.data(),
-                                                 cones.cone_offsets.data(),
-                                                 cones.small_cone_ids.data(),
+      <<<grid_dim, small_block_dim, 0, stream>>>(cones.s,
+                                                 cones.lambda,
+                                                 cuopt::make_span(cones.eta),
+                                                 cuopt::make_span(cones.inv_eta),
+                                                 cuopt::make_span(cones.inv_1pw0),
+                                                 cuopt::make_span(cones.w_bar),
+                                                 cuopt::make_span(cones.omega),
+                                                 cuopt::make_span(cones.rho),
+                                                 cuopt::make_span(cones.cone_offsets),
+                                                 cuopt::make_span(cones.small_cone_ids),
                                                  small_count);
   }
 

@@ -14,6 +14,7 @@
 #include <barrier/dense_vector.hpp>
 #include <barrier/device_sparse_matrix.cuh>
 #include <barrier/iterative_refinement.hpp>
+#include <barrier/second_order_cone.cuh>
 #include <barrier/sparse_cholesky.cuh>
 #include <barrier/sparse_matrix_kernels.cuh>
 
@@ -34,6 +35,7 @@
 #include <utilities/macros.cuh>
 
 #include <numeric>
+#include <optional>
 
 #include <raft/sparse/detail/cusparse_wrappers.h>
 #include <raft/core/nvtx.hpp>
@@ -163,6 +165,8 @@ class iteration_data_t {
       d_inv_diag(lp.num_cols, lp.handle_ptr->get_stream()),
       d_cols_to_remove(0, lp.handle_ptr->get_stream()),
       d_augmented_diagonal_indices_(0, lp.handle_ptr->get_stream()),
+      d_cone_csr_indices_(0, lp.handle_ptr->get_stream()),
+      d_cone_Q_values_(0, lp.handle_ptr->get_stream()),
       use_augmented(false),
       has_factorization(false),
       num_factorizations(0),
@@ -321,6 +325,11 @@ class iteration_data_t {
       use_augmented   = !Q_diagonal;
     }
 
+    if (cones_.has_value() && !use_augmented) {
+      n_dense_columns = 0;
+      use_augmented   = true;
+    }
+
     if (use_augmented) {
       settings.log.printf("Linear system               : augmented\n");
     } else {
@@ -427,16 +436,87 @@ class iteration_data_t {
     i_t factorization_size   = n + m;
     const f_t dual_perturb   = 0.0;
     const f_t primal_perturb = 1e-6;
+
+    const bool has_cones = cones_.has_value() && cones_->K > 0;
+    const i_t m_c        = has_cones ? cones_->m_c : 0;
+    i_t total_block_nnz  = 0;
+
+    std::vector<i_t> cone_offsets_host;
+    std::vector<i_t> cone_block_offsets_host;
+    if (has_cones) {
+      cone_offsets_host.resize(cones_->K + 1);
+      cone_block_offsets_host.resize(cones_->K + 1);
+      raft::copy(
+        cone_offsets_host.data(), cones_->cone_offsets.data(), cones_->K + 1, stream_view_);
+      raft::copy(
+        cone_block_offsets_host.data(), cones_->block_offsets.data(), cones_->K + 1, stream_view_);
+      handle_ptr->sync_stream();
+      total_block_nnz = cone_block_offsets_host[cones_->K];
+    }
+
     if (first_call) {
-      i_t new_nnz = 2 * nnzA + n + m + nnzQ;
+      i_t new_nnz = 2 * nnzA + n + m + nnzQ + total_block_nnz;
       csr_matrix_t<i_t, f_t> augmented_CSR(n + m, n + m, new_nnz);
       std::vector<i_t> augmented_diagonal_indices(n + m, -1);
+      std::vector<i_t> cone_csr_indices_host(total_block_nnz, -1);
+      std::vector<f_t> cone_Q_values_host(total_block_nnz, f_t(0));
       i_t q            = 0;
       i_t off_diag_Qnz = 0;
 
       for (i_t i = 0; i < n; i++) {
         augmented_CSR.row_start[i] = q;
-        if (nnzQ == 0) {
+
+        const bool is_cone_row = has_cones && i >= cone_var_start_ && i < cone_var_start_ + m_c;
+
+        if (is_cone_row) {
+          // Determine which cone this variable belongs to and its local row
+          i_t local_idx = i - cone_var_start_;
+          i_t k         = 0;
+          while (k + 1 < cones_->K && cone_offsets_host[k + 1] <= local_idx) {
+            k++;
+          }
+          i_t local_r        = local_idx - cone_offsets_host[k];
+          i_t q_k            = cone_offsets_host[k + 1] - cone_offsets_host[k];
+          i_t cone_col_start = cone_var_start_ + cone_offsets_host[k];
+          i_t block_base     = cone_block_offsets_host[k] + local_r * q_k;
+
+          // Merge-join: Q entries (sorted) with dense cone block columns (contiguous)
+          i_t qp    = (nnzQ > 0) ? Q.col_start[i] : 0;
+          i_t q_end = (nnzQ > 0) ? Q.col_start[i + 1] : 0;
+
+          // Q entries before cone block
+          while (qp < q_end && Q.i[qp] < cone_col_start) {
+            augmented_CSR.j[q]   = Q.i[qp];
+            augmented_CSR.x[q++] = -Q.x[qp];
+            off_diag_Qnz++;
+            qp++;
+          }
+
+          // Dense cone block, absorbing any Q entries that fall inside
+          for (i_t c = 0; c < q_k; c++) {
+            i_t col   = cone_col_start + c;
+            f_t q_val = (c == local_r) ? dual_perturb : f_t(0);
+
+            if (qp < q_end && Q.i[qp] == col) {
+              q_val += Q.x[qp];
+              qp++;
+            }
+
+            cone_csr_indices_host[block_base + c] = q;
+            cone_Q_values_host[block_base + c]    = q_val;
+            if (col == i) { augmented_diagonal_indices[i] = q; }
+            augmented_CSR.j[q]   = col;
+            augmented_CSR.x[q++] = f_t(0);
+          }
+
+          // Q entries after cone block
+          while (qp < q_end) {
+            augmented_CSR.j[q]   = Q.i[qp];
+            augmented_CSR.x[q++] = -Q.x[qp];
+            off_diag_Qnz++;
+            qp++;
+          }
+        } else if (nnzQ == 0) {
           augmented_diagonal_indices[i] = q;
           augmented_CSR.j[q]            = i;
           augmented_CSR.x[q++]          = -diag[i] - dual_perturb;
@@ -489,8 +569,9 @@ class iteration_data_t {
       augmented_CSR.nz_max           = q;
       augmented_CSR.j.resize(q);
       augmented_CSR.x.resize(q);
-      settings_.log.debug("augmented nz %d predicted %d\n", q, off_diag_Qnz + nnzA + n);
-      cuopt_assert(q == 2 * nnzA + n + m + off_diag_Qnz, "augmented nnz != predicted");
+      i_t expected_nnz = 2 * nnzA + (n - m_c) + total_block_nnz + m + off_diag_Qnz;
+      settings_.log.debug("augmented nz %d predicted %d\n", q, expected_nnz);
+      cuopt_assert(q == expected_nnz, "augmented nnz != predicted");
       cuopt_assert(A.col_start[n] == AT.col_start[m], "A nz != AT nz");
 
       device_augmented.copy(augmented_CSR, handle_ptr->get_stream());
@@ -500,6 +581,20 @@ class iteration_data_t {
                  augmented_diagonal_indices.data(),
                  augmented_diagonal_indices.size(),
                  handle_ptr->get_stream());
+
+      if (has_cones) {
+        d_cone_csr_indices_.resize(total_block_nnz, handle_ptr->get_stream());
+        raft::copy(d_cone_csr_indices_.data(),
+                   cone_csr_indices_host.data(),
+                   total_block_nnz,
+                   handle_ptr->get_stream());
+        d_cone_Q_values_.resize(total_block_nnz, handle_ptr->get_stream());
+        raft::copy(d_cone_Q_values_.data(),
+                   cone_Q_values_host.data(),
+                   total_block_nnz,
+                   handle_ptr->get_stream());
+      }
+
       handle_ptr->sync_stream();
 #ifdef CHECK_SYMMETRY
       csc_matrix_t<i_t, f_t> augmented_transpose(1, 1, 1);
@@ -538,6 +633,15 @@ class iteration_data_t {
                            span_x[span_diag_indices[j]] = primal_perturb_value;
                          });
       RAFT_CHECK_CUDA(handle_ptr->get_stream());
+
+      if (has_cones) {
+        scatter_hinv2_into_augmented(*cones_,
+                                     device_augmented.x,
+                                     d_cone_csr_indices_,
+                                     d_cone_Q_values_,
+                                     handle_ptr->get_stream());
+        RAFT_CHECK_CUDA(handle_ptr->get_stream());
+      }
     }
   }
 
@@ -1530,8 +1634,13 @@ class iteration_data_t {
   std::vector<f_t> Qdiag;
   bool Q_diagonal;
   rmm::device_uvector<i_t> d_augmented_diagonal_indices_;
+  rmm::device_uvector<i_t> d_cone_csr_indices_;
+  rmm::device_uvector<f_t> d_cone_Q_values_;
   bool indefinite_Q;
   cusparse_view_t<i_t, f_t> cusparse_Q_view_;
+
+  std::optional<cone_data_t<i_t, f_t>> cones_;
+  i_t cone_var_start_ = 0;
 
   bool use_augmented;
   i_t symbolic_status;
