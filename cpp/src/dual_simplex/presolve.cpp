@@ -22,22 +22,15 @@ namespace cuopt::linear_programming::dual_simplex {
 template <typename i_t, typename f_t>
 i_t remove_empty_cols(lp_problem_t<i_t, f_t>& problem,
                       i_t& num_empty_cols,
-                      presolve_info_t<i_t, f_t>& presolve_info)
+                      presolve_info_t<i_t, f_t>& presolve_info,
+                      const std::vector<bool>& is_cone_variable)
 {
   constexpr bool verbose = false;
   if (verbose) { printf("Removing %d empty columns\n", num_empty_cols); }
-  // We have a variable x_j that does not appear in any rows
-  // The cost function
-  // sum_{k != j} c_k * x_k + c_j * x_j
-  // becomes
-  // sum_{k != j} c_k * x_k + c_j * l_j if c_j > 0
-  // or
-  // sum_{k != j} c_k * x_k + c_j * u_j if c_j < 0
   presolve_info.removed_variables.reserve(num_empty_cols);
   presolve_info.removed_values.reserve(num_empty_cols);
   presolve_info.removed_reduced_costs.reserve(num_empty_cols);
 
-  // Check to see if a variable participates in a quadratic objective
   std::vector<bool> has_quadratic_term(problem.num_cols, false);
 
   if (problem.Q.n > 0) {
@@ -45,7 +38,6 @@ i_t remove_empty_cols(lp_problem_t<i_t, f_t>& problem,
       const i_t row_start = problem.Q.row_start[j];
       const i_t row_end   = problem.Q.row_start[j + 1];
       if (row_end - row_start == 0) { continue; }
-      // Q is symmetric, so its sufficient to check only the row size
       has_quadratic_term[j] = true;
     }
   }
@@ -55,11 +47,12 @@ i_t remove_empty_cols(lp_problem_t<i_t, f_t>& problem,
   for (i_t j = 0; j < problem.num_cols; ++j) {
     bool remove_var = false;
     if ((problem.A.col_start[j + 1] - problem.A.col_start[j]) == 0) {
-      if (problem.objective[j] >= 0 && problem.lower[j] > -inf && !has_quadratic_term[j]) {
+      bool non_removable = has_quadratic_term[j] || is_cone_variable[j];
+      if (problem.objective[j] >= 0 && problem.lower[j] > -inf && !non_removable) {
         presolve_info.removed_values.push_back(problem.lower[j]);
         problem.obj_constant += problem.objective[j] * problem.lower[j];
         remove_var = true;
-      } else if (problem.objective[j] <= 0 && problem.upper[j] < inf && !has_quadratic_term[j]) {
+      } else if (problem.objective[j] <= 0 && problem.upper[j] < inf && !non_removable) {
         presolve_info.removed_values.push_back(problem.upper[j]);
         problem.obj_constant += problem.objective[j] * problem.upper[j];
         remove_var = true;
@@ -570,16 +563,18 @@ void convert_user_problem(const user_problem_t<i_t, f_t>& user_problem,
   }
 
   // Copy info from user_problem to problem
-  problem.num_rows              = user_problem.num_rows;
-  problem.num_cols              = user_problem.num_cols;
-  problem.A                     = user_problem.A;
-  problem.objective             = user_problem.objective;
-  problem.obj_scale             = user_problem.obj_scale;
-  problem.obj_constant          = user_problem.obj_constant;
-  problem.objective_is_integral = user_problem.objective_is_integral;
-  problem.rhs                   = user_problem.rhs;
-  problem.lower                 = user_problem.lower;
-  problem.upper                 = user_problem.upper;
+  problem.num_rows               = user_problem.num_rows;
+  problem.num_cols               = user_problem.num_cols;
+  problem.A                      = user_problem.A;
+  problem.objective              = user_problem.objective;
+  problem.obj_scale              = user_problem.obj_scale;
+  problem.obj_constant           = user_problem.obj_constant;
+  problem.objective_is_integral  = user_problem.objective_is_integral;
+  problem.rhs                    = user_problem.rhs;
+  problem.lower                  = user_problem.lower;
+  problem.upper                  = user_problem.upper;
+  problem.cone_var_start         = user_problem.cone_var_start;
+  problem.second_order_cone_dims = user_problem.second_order_cone_dims;
 
   // Make a copy of row_sense so we can modify it
   std::vector<char> row_sense = user_problem.row_sense;
@@ -636,6 +631,7 @@ void convert_user_problem(const user_problem_t<i_t, f_t>& user_problem,
   settings.log.debug(
     "equality rows %d less rows %d columns %d\n", equal_rows, less_rows, problem.num_cols);
   if (settings.barrier && settings.dualize != 0 && user_problem.Q_values.size() == 0 &&
+      user_problem.second_order_cone_dims.empty() &&
       (settings.dualize == 1 ||
        (settings.dualize == -1 && less_rows > 1.2 * problem.num_cols && equal_rows < 2e4))) {
     settings.log.debug("Dualizing in presolve\n");
@@ -821,10 +817,26 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
 {
   problem = original;
   std::vector<char> row_sense(problem.num_rows, '=');
+  auto build_is_cone_variable = [](const lp_problem_t<i_t, f_t>& current_problem) {
+    std::vector<bool> is_cone_variable(current_problem.num_cols, false);
+    if (!current_problem.second_order_cone_dims.empty()) {
+      i_t cone_end = current_problem.cone_var_start;
+      for (auto q_k : current_problem.second_order_cone_dims) {
+        cone_end += q_k;
+      }
+      for (i_t j = current_problem.cone_var_start; j < cone_end; ++j) {
+        is_cone_variable[j] = true;
+      }
+    }
+    return is_cone_variable;
+  };
+  auto is_cone_variable = build_is_cone_variable(problem);
   // Check for free variables
   i_t free_variables = 0;
   for (i_t j = 0; j < problem.num_cols; j++) {
-    if (problem.lower[j] == -inf && problem.upper[j] == inf) { free_variables++; }
+    if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
+      free_variables++;
+    }
   }
 
   if (settings.barrier_presolve && free_variables > 0) {
@@ -835,7 +847,7 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     current_free_variables.reserve(problem.num_cols);
     constraints_to_check.reserve(problem.num_rows);
     for (i_t j = 0; j < problem.num_cols; j++) {
-      if (problem.lower[j] == -inf && problem.upper[j] == inf) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
         current_free_variables.push_back(j);
         const i_t col_start = problem.A.col_start[j];
         const i_t col_end   = problem.A.col_start[j + 1];
@@ -975,7 +987,9 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
 
     i_t new_free_variables = 0;
     for (i_t j = 0; j < problem.num_cols; j++) {
-      if (problem.lower[j] == -inf && problem.upper[j] == inf) { new_free_variables++; }
+      if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
+        new_free_variables++;
+      }
     }
     if (removed_free_variables != 0) {
       settings.log.printf("Bounded %d free variables\n", removed_free_variables);
@@ -1134,9 +1148,18 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
   }
   if (num_empty_cols > 0) {
     settings.log.printf("Presolve attempt to remove %d empty cols\n", num_empty_cols);
-    remove_empty_cols(problem, num_empty_cols, presolve_info);
+    remove_empty_cols(problem, num_empty_cols, presolve_info, is_cone_variable);
   }
 
+  is_cone_variable = build_is_cone_variable(problem);
+
+  // Check for free variables (exclude cone variables — they are naturally unbounded)
+  free_variables = 0;
+  for (i_t j = 0; j < problem.num_cols; j++) {
+    if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
+      free_variables++;
+    }
+  }
   problem.Q.check_matrix("Before free variable expansion");
 
   if (settings.barrier_presolve && free_variables > 0) {
@@ -1156,7 +1179,7 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     i_t num_cols = problem.num_cols + free_variables;
     i_t nnz      = problem.A.col_start[problem.num_cols];
     for (i_t j = 0; j < problem.num_cols; j++) {
-      if (problem.lower[j] == -inf && problem.upper[j] == inf) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
         nnz += (problem.A.col_start[j + 1] - problem.A.col_start[j]);
       }
     }
@@ -1173,7 +1196,7 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     i_t q          = problem.A.col_start[problem.num_cols];
     i_t col        = problem.num_cols;
     for (i_t j = 0; j < problem.num_cols; j++) {
-      if (problem.lower[j] == -inf && problem.upper[j] == inf) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf && !is_cone_variable[j]) {
         for (i_t p = problem.A.col_start[j]; p < problem.A.col_start[j + 1]; p++) {
           i_t i          = problem.A.i[p];
           f_t aij        = problem.A.x[p];
@@ -1286,7 +1309,8 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     problem.num_cols = num_cols;
   }
 
-  if (settings.barrier_presolve && settings.folding != 0 && problem.Q.n == 0) {
+  if (settings.barrier_presolve && settings.folding != 0 && problem.Q.n == 0 &&
+      problem.second_order_cone_dims.empty()) {
     folding(problem, settings, presolve_info);
   }
 

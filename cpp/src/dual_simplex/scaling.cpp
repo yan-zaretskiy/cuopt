@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -29,9 +29,20 @@ i_t column_scaling(const lp_problem_t<i_t, f_t>& unscaled,
   }
 
   column_scaling.resize(n);
+
+  i_t cone_start = unscaled.cone_var_start;
+  i_t cone_end   = cone_start;
+  for (auto q_k : unscaled.second_order_cone_dims) {
+    cone_end += q_k;
+  }
+
   f_t max = 0;
   f_t min = std::numeric_limits<f_t>::max();
   for (i_t j = 0; j < n; ++j) {
+    if (j >= cone_start && j < cone_end) {
+      column_scaling[j] = 1.0;
+      continue;
+    }
     const i_t col_start = scaled.A.col_start[j];
     const i_t col_end   = scaled.A.col_start[j + 1];
     f_t sum             = 0.0;

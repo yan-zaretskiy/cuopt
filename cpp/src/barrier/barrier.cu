@@ -213,6 +213,8 @@ class iteration_data_t {
       d_complementarity_xz_rhs_(lp.num_cols, lp.handle_ptr->get_stream()),
       d_complementarity_wv_rhs_(0, lp.handle_ptr->get_stream()),
       d_dual_rhs_(lp.num_cols, lp.handle_ptr->get_stream()),
+      d_cone_rhs_term_(0, lp.handle_ptr->get_stream()),
+      d_cone_hinv2_dx_(0, lp.handle_ptr->get_stream()),
       d_Q_diag_(0, lp.handle_ptr->get_stream()),
       d_Qx_(Qin.m, lp.handle_ptr->get_stream()),
       restrict_u_(0),
@@ -220,7 +222,9 @@ class iteration_data_t {
       sum_reduce_helper_(lp.handle_ptr->get_stream()),
       indefinite_Q(false),
       Q_diagonal(false),
-      symbolic_status(0)
+      symbolic_status(0),
+      cone_combined_step_(false),
+      cone_sigma_mu_(f_t(0))
   {
     raft::common::nvtx::range fun_scope("Barrier: LP Data Creation");
 
@@ -260,6 +264,20 @@ class iteration_data_t {
 
       d_Q_diag_.resize(lp.num_cols, stream_view_);
       raft::copy(d_Q_diag_.data(), Qdiag.data(), Qdiag.size(), stream_view_);
+    }
+
+    if (!lp.second_order_cone_dims.empty()) {
+      cone_var_start_ = lp.cone_var_start;
+      i_t total_cone_dim =
+        std::accumulate(lp.second_order_cone_dims.begin(), lp.second_order_cone_dims.end(), i_t(0));
+      cuopt_assert(cone_var_start_ >= 0, "cone_var_start must be nonnegative");
+      cuopt_assert(cone_var_start_ + total_cone_dim <= lp.num_cols,
+                   "cone variables exceed problem dimension");
+      cones_.emplace(static_cast<i_t>(lp.second_order_cone_dims.size()),
+                     lp.second_order_cone_dims,
+                     raft::device_span<f_t>{},
+                     raft::device_span<f_t>{},
+                     stream_view_);
     }
 
     // Allocating GPU flag data for Form ADAT
@@ -1515,8 +1533,9 @@ class iteration_data_t {
                           f_t beta,
                           rmm::device_uvector<f_t>& y)
   {
-    const i_t m = A.m;
-    const i_t n = A.n;
+    const i_t m          = A.m;
+    const i_t n          = A.n;
+    const bool has_cones = cones_.has_value() && cones_->K > 0;
 
     rmm::device_uvector<f_t> d_x1(n, handle_ptr->get_stream());
     rmm::device_uvector<f_t> d_x2(m, handle_ptr->get_stream());
@@ -1535,11 +1554,24 @@ class iteration_data_t {
     // diag.pairwise_product(x1, r1);
     // r1 <- D * x_1
     pairwise_multiply(d_x1.data(), d_diag_.data(), d_r1.data(), n, stream_view_);
+    if (has_cones) {
+      thrust::fill_n(
+        rmm::exec_policy(stream_view_), d_r1.begin() + cone_var_start_, cones_->m_c, f_t(0));
+    }
 
     // r1 <- Q x1 + D x1
     if (Q.n > 0) {
       // matrix_vector_multiply(Q, 1.0, x1, 1.0, r1);
       cusparse_Q_view_.spmv(1.0, d_x1, 1.0, d_r1);
+    }
+    if (has_cones) {
+      accumulate_cone_hinv2_matvec(
+        raft::device_span<const f_t>(d_x1.data() + cone_var_start_, cones_->m_c),
+        *cones_,
+        d_cone_hinv2_dx_,
+        raft::device_span<f_t>(d_r1.data() + cone_var_start_, cones_->m_c),
+        stream_view_);
+      RAFT_CHECK_CUDA(stream_view_);
     }
 
     // y1 <- - alpha * r1 + beta * y1
@@ -1739,6 +1771,8 @@ class iteration_data_t {
   rmm::device_uvector<f_t> d_complementarity_xz_rhs_;
   rmm::device_uvector<f_t> d_complementarity_wv_rhs_;
   rmm::device_uvector<f_t> d_dual_rhs_;
+  rmm::device_uvector<f_t> d_cone_rhs_term_;
+  rmm::device_uvector<f_t> d_cone_hinv2_dx_;
 
   rmm::device_uvector<f_t> d_Q_diag_;
   rmm::device_uvector<f_t> d_Qx_;
@@ -1747,6 +1781,9 @@ class iteration_data_t {
 
   transform_reduce_helper_t<f_t> transform_reduce_helper_;
   sum_reduce_helper_t<f_t> sum_reduce_helper_;
+
+  bool cone_combined_step_;
+  f_t cone_sigma_mu_;
 
   rmm::cuda_stream_view stream_view_;
 
@@ -1846,6 +1883,7 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
 {
   raft::common::nvtx::range fun_scope("Barrier: initial_point");
   const bool use_augmented = data.use_augmented;
+  const bool has_cones     = data.cones_.has_value() && data.cones_->K > 0;
 
   // Perform a numerical factorization
   i_t status;
@@ -2004,8 +2042,10 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
         data.v[k] = -c[j] + epsilon;
       }
     }
-    // Now hande the case with no upper bounds
+    // Now hande the case with no upper bounds (skip cone variables)
+    const i_t cone_end = has_cones ? data.cone_var_start_ + data.cones_->m_c : 0;
     for (i_t j = 0; j < lp.num_cols; j++) {
+      if (has_cones && j >= data.cone_var_start_ && j < cone_end) continue;
       if (lp.upper[j] == inf) {
         if (c[j] > epsilon_adjust) {
           data.z[j] = c[j];
@@ -2034,7 +2074,8 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
     data.v.multiply_scalar(-1.0);
 
     data.v.ensure_positive(epsilon_adjust);
-    data.z.ensure_positive(epsilon_adjust);
+    data.z.ensure_positive_skip_range(
+      epsilon_adjust, data.cone_var_start_, has_cones ? data.cones_->m_c : 0);
   } else {
     // First compute rhs = A*Dinv*c
     dense_vector_t<i_t, f_t> rhs(lp.num_rows);
@@ -2058,7 +2099,8 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
     data.gather_upper_bounds(data.z, data.v);
     data.v.multiply_scalar(-1.0);
     data.v.ensure_positive(epsilon_adjust);
-    data.z.ensure_positive(epsilon_adjust);
+    data.z.ensure_positive_skip_range(
+      epsilon_adjust, data.cone_var_start_, has_cones ? data.cones_->m_c : 0);
   }
 
   // Verify A'*y + z - E*v  - Q*x = c
@@ -2075,9 +2117,33 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
   settings.log.printf("||A^T y + z - E*v - Q*x - c ||: %e\n",
                       vector_norm2<i_t, f_t>(data.dual_residual));
 #endif
-  // Make sure (w, x, v, z) > 0
+  // Make sure (w, x, v, z) > 0; skip cone vars — handled by shift_into_interior below
   data.w.ensure_positive(epsilon_adjust);
-  data.x.ensure_positive(epsilon_adjust);
+  data.x.ensure_positive_skip_range(
+    epsilon_adjust, data.cone_var_start_, has_cones ? data.cones_->m_c : 0);
+
+  if (has_cones) {
+    const auto& dims = lp.second_order_cone_dims;
+    i_t cs           = data.cone_var_start_;
+    i_t off          = 0;
+
+    for (i_t k = 0; k < static_cast<i_t>(dims.size()); ++k) {
+      i_t q_k                  = dims[k];
+      auto shift_into_interior = [&](auto& vec) {
+        f_t tail_sq = f_t(0);
+        for (i_t j = 1; j < q_k; ++j) {
+          f_t v = vec[cs + off + j];
+          tail_sq += v * v;
+        }
+        f_t gap = std::sqrt(tail_sq) - vec[cs + off];
+        if (gap >= f_t(0)) { vec[cs + off] += f_t(1) + gap; }
+      };
+      shift_into_interior(data.x);
+      shift_into_interior(data.z);
+      off += q_k;
+    }
+  }
+
 #ifdef PRINT_INFO
   settings.log.printf("min v %e min z %e\n", data.v.minimum(), data.z.minimum());
 #endif
@@ -2272,16 +2338,51 @@ f_t barrier_solver_t<i_t, f_t>::gpu_max_step_to_boundary(iteration_data_t<i_t, f
                                                          const rmm::device_uvector<f_t>& x,
                                                          const rmm::device_uvector<f_t>& dx)
 {
+  const bool has_cones = data.cones_.has_value() && data.cones_->K > 0;
+  const bool skip_cone_range =
+    has_cones && static_cast<i_t>(x.size()) >= data.cone_var_start_ + data.cones_->m_c;
+
+  auto ratio_test = [] HD(const thrust::tuple<f_t, f_t> t) {
+    const f_t dx = thrust::get<0>(t);
+    const f_t x  = thrust::get<1>(t);
+    if (dx < f_t(0.0)) return -x / dx;
+    return f_t(1.0);
+  };
+
+  if (skip_cone_range) {
+    i_t cs    = data.cone_var_start_;
+    i_t mc    = data.cones_->m_c;
+    f_t alpha = f_t(1);
+
+    if (cs > 0) {
+      alpha = std::min(alpha,
+                       data.transform_reduce_helper_.transform_reduce(
+                         thrust::make_zip_iterator(dx.data(), x.data()),
+                         thrust::minimum<f_t>(),
+                         ratio_test,
+                         f_t(1),
+                         cs,
+                         stream_view_));
+    }
+    i_t tail_start = cs + mc;
+    i_t tail_size  = static_cast<i_t>(x.size()) - tail_start;
+    if (tail_size > 0) {
+      alpha = std::min(alpha,
+                       data.transform_reduce_helper_.transform_reduce(
+                         thrust::make_zip_iterator(dx.data() + tail_start, x.data() + tail_start),
+                         thrust::minimum<f_t>(),
+                         ratio_test,
+                         f_t(1),
+                         tail_size,
+                         stream_view_));
+    }
+    return alpha;
+  }
+
   return data.transform_reduce_helper_.transform_reduce(
     thrust::make_zip_iterator(dx.data(), x.data()),
     thrust::minimum<f_t>(),
-    [] HD(const thrust::tuple<f_t, f_t> t) {
-      const f_t dx = thrust::get<0>(t);
-      const f_t x  = thrust::get<1>(t);
-
-      if (dx < f_t(0.0)) return -x / dx;
-      return f_t(1.0);
-    },
+    ratio_test,
     f_t(1.0),
     x.size(),
     stream_view_);
@@ -2300,6 +2401,9 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
 
   const bool debug         = false;
   const bool use_augmented = data.use_augmented;
+  const bool has_cones     = data.cones_.has_value() && data.cones_->K > 0;
+  const i_t m_c            = has_cones ? data.cones_->m_c : 0;
+  const i_t cone_var_start = data.cone_var_start_;
 
   {
     raft::common::nvtx::range fun_scope("Barrier: GPU allocation and copies");
@@ -2340,6 +2444,24 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
     raft::copy(data.d_upper_.data(), lp.upper.data(), lp.upper.size(), stream_view_);
   }
 
+  if (has_cones) {
+    data.cones_->s      = raft::device_span<f_t>(data.d_x_.data() + cone_var_start, m_c);
+    data.cones_->lambda = raft::device_span<f_t>(data.d_z_.data() + cone_var_start, m_c);
+    launch_nt_scaling(*data.cones_, stream_view_);
+
+    if (data.cone_combined_step_) {
+      compute_combined_cone_rhs_term(
+        raft::device_span<const f_t>(data.d_dx_aff_.data() + cone_var_start, m_c),
+        *data.cones_,
+        data.cone_sigma_mu_,
+        data.d_cone_rhs_term_,
+        stream_view_);
+    } else {
+      compute_affine_cone_rhs_term(*data.cones_, data.d_cone_rhs_term_, stream_view_);
+    }
+    RAFT_CHECK_CUDA(stream_view_);
+  }
+
   // Solves the linear system
   //
   //  dw dx dy dv dz
@@ -2353,13 +2475,18 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
   {
     raft::common::nvtx::range fun_scope("Barrier: GPU diag, inv diag and sqrt inv diag formation");
 
-    // diag = z ./ x
+    // diag = z ./ x  (cone entries are overwritten by H^{-2} in the augmented matrix)
     cub::DeviceTransform::Transform(cuda::std::make_tuple(data.d_z_.data(), data.d_x_.data()),
                                     data.d_diag_.data(),
                                     data.d_diag_.size(),
                                     cuda::std::divides<>{},
                                     stream_view_.value());
     RAFT_CHECK_CUDA(stream_view_);
+
+    if (has_cones) {
+      thrust::fill_n(
+        rmm::exec_policy(stream_view_), data.d_diag_.begin() + cone_var_start, m_c, f_t(1));
+    }
     // diag = z ./ x + E * (v ./ w) * E'
 
     if (data.n_upper_bounds > 0) {
@@ -2450,22 +2577,45 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       },
       stream_view_.value());
     RAFT_CHECK_CUDA(stream_view_);
-    // tmp3 <- tmp3 .+ -(complementarity_xz_rhs ./ x) .+ dual_rhs
+    // tmp3 <- tmp3 .+ -(complementarity_xz_rhs ./ x) .+ dual_rhs + cone_rhs_term(on cone slice)
+    // The cone sign is + because the NT back-sub target is -cone_rhs, so rhs = r_d - (-cone_rhs).
     // tmp4 <- inv_diag .* tmp3
-    cub::DeviceTransform::Transform(
-      cuda::std::make_tuple(data.d_inv_diag.data(),
-                            data.d_tmp3_.data(),
-                            data.d_complementarity_xz_rhs_.data(),
-                            data.d_x_.data(),
-                            data.d_dual_rhs_.data()),
-      thrust::make_zip_iterator(data.d_tmp3_.data(), data.d_tmp4_.data()),
-      lp.num_cols,
-      [] HD(f_t inv_diag, f_t tmp3, f_t complementarity_xz_rhs, f_t x, f_t dual_rhs)
-        -> thrust::tuple<f_t, f_t> {
-        const f_t tmp = tmp3 + -(complementarity_xz_rhs / x) + dual_rhs;
-        return {tmp, inv_diag * tmp};
-      },
-      stream_view_.value());
+    if (has_cones) {
+      thrust::for_each_n(rmm::exec_policy(stream_view_),
+                         thrust::make_counting_iterator<i_t>(0),
+                         lp.num_cols,
+                         [span_inv_diag = cuopt::make_span(data.d_inv_diag),
+                          span_tmp3     = cuopt::make_span(data.d_tmp3_),
+                          span_tmp4     = cuopt::make_span(data.d_tmp4_),
+                          span_xz_rhs   = cuopt::make_span(data.d_complementarity_xz_rhs_),
+                          span_x        = cuopt::make_span(data.d_x_),
+                          span_dual_rhs = cuopt::make_span(data.d_dual_rhs_),
+                          span_cone_rhs = cuopt::make_span(data.d_cone_rhs_term_),
+                          cone_start    = cone_var_start,
+                          cone_size     = m_c] __device__(i_t j) {
+                           bool is_cone = (j >= cone_start && j < cone_start + cone_size);
+                           f_t cone_rhs = is_cone ? span_cone_rhs[j - cone_start] : f_t(0);
+                           f_t xz_term  = is_cone ? f_t(0) : -(span_xz_rhs[j] / span_x[j]);
+                           f_t tmp      = span_tmp3[j] + xz_term + span_dual_rhs[j] + cone_rhs;
+                           span_tmp3[j] = tmp;
+                           span_tmp4[j] = span_inv_diag[j] * tmp;
+                         });
+    } else {
+      cub::DeviceTransform::Transform(
+        cuda::std::make_tuple(data.d_inv_diag.data(),
+                              data.d_tmp3_.data(),
+                              data.d_complementarity_xz_rhs_.data(),
+                              data.d_x_.data(),
+                              data.d_dual_rhs_.data()),
+        thrust::make_zip_iterator(data.d_tmp3_.data(), data.d_tmp4_.data()),
+        lp.num_cols,
+        [] HD(f_t inv_diag, f_t tmp3, f_t complementarity_xz_rhs, f_t x, f_t dual_rhs)
+          -> thrust::tuple<f_t, f_t> {
+          const f_t tmp = tmp3 + -(complementarity_xz_rhs / x) + dual_rhs;
+          return {tmp, inv_diag * tmp};
+        },
+        stream_view_.value());
+    }
     RAFT_CHECK_CUDA(stream_view_);
     raft::copy(data.d_r1_.data(), data.d_tmp3_.data(), data.d_tmp3_.size(), stream_view_);
     raft::copy(data.d_r1_prime_.data(), data.d_tmp3_.data(), data.d_tmp3_.size(), stream_view_);
@@ -2749,18 +2899,42 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
   {
     raft::common::nvtx::range fun_scope("Barrier: dz formation GPU");
 
-    // dz = (complementarity_xz_rhs - z.* dx) ./ x;
-    cub::DeviceTransform::Transform(
-      cuda::std::make_tuple(data.d_complementarity_xz_rhs_.data(),
-                            data.d_z_.data(),
-                            data.d_dx_.data(),
-                            data.d_x_.data()),
-      data.d_dz_.data(),
-      data.d_dz_.size(),
-      [] HD(f_t complementarity_xz_rhs, f_t z, f_t dx, f_t x) {
-        return (complementarity_xz_rhs - z * dx) / x;
-      },
-      stream_view_.value());
+    if (has_cones) {
+      recover_cone_dz(raft::device_span<const f_t>(data.d_dx_.data() + cone_var_start, m_c),
+                      *data.cones_,
+                      data.d_cone_rhs_term_,
+                      data.d_cone_hinv2_dx_,
+                      raft::device_span<f_t>(data.d_dz_.data() + cone_var_start, m_c),
+                      stream_view_);
+
+      thrust::for_each_n(rmm::exec_policy(stream_view_),
+                         thrust::make_counting_iterator<i_t>(0),
+                         data.d_dz_.size(),
+                         [span_xz_rhs = cuopt::make_span(data.d_complementarity_xz_rhs_),
+                          span_z      = cuopt::make_span(data.d_z_),
+                          span_dx     = cuopt::make_span(data.d_dx_),
+                          span_x      = cuopt::make_span(data.d_x_),
+                          span_dz     = cuopt::make_span(data.d_dz_),
+                          cone_start  = cone_var_start,
+                          cone_size   = m_c] __device__(i_t j) {
+                           if (j < cone_start || j >= cone_start + cone_size) {
+                             span_dz[j] = (span_xz_rhs[j] - span_z[j] * span_dx[j]) / span_x[j];
+                           }
+                         });
+    } else {
+      // dz = (complementarity_xz_rhs - z.* dx) ./ x;
+      cub::DeviceTransform::Transform(
+        cuda::std::make_tuple(data.d_complementarity_xz_rhs_.data(),
+                              data.d_z_.data(),
+                              data.d_dx_.data(),
+                              data.d_x_.data()),
+        data.d_dz_.data(),
+        data.d_dz_.size(),
+        [] HD(f_t complementarity_xz_rhs, f_t z, f_t dx, f_t x) {
+          return (complementarity_xz_rhs - z * dx) / x;
+        },
+        stream_view_.value());
+    }
     RAFT_CHECK_CUDA(stream_view_);
     raft::copy(dz.data(), data.d_dz_.data(), data.d_dz_.size(), stream_view_);
   }
@@ -2944,10 +3118,13 @@ template <typename i_t, typename f_t>
 void barrier_solver_t<i_t, f_t>::compute_affine_rhs(iteration_data_t<i_t, f_t>& data)
 {
   raft::common::nvtx::range fun_scope("Barrier: compute_affine_rhs");
+  const bool has_cones = data.cones_.has_value() && data.cones_->K > 0;
 
-  data.primal_rhs = data.primal_residual;
-  data.bound_rhs  = data.bound_residual;
-  data.dual_rhs   = data.dual_residual;
+  data.primal_rhs          = data.primal_residual;
+  data.bound_rhs           = data.bound_residual;
+  data.dual_rhs            = data.dual_residual;
+  data.cone_combined_step_ = false;
+  data.cone_sigma_mu_      = f_t(0);
 
   raft::copy(data.d_complementarity_xz_rhs_.data(),
              data.d_complementarity_xz_residual_.data(),
@@ -2966,6 +3143,12 @@ void barrier_solver_t<i_t, f_t>::compute_affine_rhs(iteration_data_t<i_t, f_t>& 
     [] HD(f_t xz_rhs) { return -xz_rhs; },
     stream_view_.value());
   RAFT_CHECK_CUDA(stream_view_);
+  if (has_cones) {
+    thrust::fill_n(rmm::exec_policy(stream_view_),
+                   data.d_complementarity_xz_rhs_.begin() + data.cone_var_start_,
+                   data.cones_->m_c,
+                   f_t(0));
+  }
   // w.*v -> -w .* v
   cub::DeviceTransform::Transform(
     data.d_complementarity_wv_rhs_.data(),
@@ -2981,6 +3164,7 @@ void barrier_solver_t<i_t, f_t>::compute_target_mu(
   iteration_data_t<i_t, f_t>& data, f_t mu, f_t& mu_aff, f_t& sigma, f_t& new_mu)
 {
   raft::common::nvtx::range fun_scope("Barrier: compute_target_mu");
+  const bool has_cones = data.cones_.has_value() && data.cones_->K > 0;
 
   f_t complementarity_aff_sum = 0.0;
   // TMP no copy and data should always be on the GPU
@@ -2998,6 +3182,21 @@ void barrier_solver_t<i_t, f_t>::compute_target_mu(
                                  gpu_max_step_to_boundary(data, data.d_x_, data.d_dx_aff_));
   f_t step_dual_aff   = std::min(gpu_max_step_to_boundary(data, data.d_v_, data.d_dv_aff_),
                                gpu_max_step_to_boundary(data, data.d_z_, data.d_dz_aff_));
+
+  if (has_cones) {
+    i_t cs          = data.cone_var_start_;
+    i_t mc          = data.cones_->m_c;
+    step_primal_aff = std::min(
+      step_primal_aff,
+      compute_cone_step_length(*data.cones_,
+                               raft::device_span<const f_t>(data.d_x_.data() + cs, mc),
+                               raft::device_span<const f_t>(data.d_dx_aff_.data() + cs, mc),
+                               raft::device_span<const f_t>(data.d_z_.data() + cs, mc),
+                               raft::device_span<const f_t>(data.d_dz_aff_.data() + cs, mc),
+                               step_primal_aff,
+                               stream_view_));
+    step_dual_aff = step_primal_aff;
+  }
 
   if (data.Q.n > 0) { step_primal_aff = step_dual_aff = std::min(step_primal_aff, step_dual_aff); }
 
@@ -3050,9 +3249,12 @@ void barrier_solver_t<i_t, f_t>::compute_target_mu(
     stream_view_);
 
   complementarity_aff_sum = complementarity_xz_aff_sum + complementarity_wv_aff_sum;
-
-  mu_aff = (complementarity_aff_sum) /
-           (static_cast<f_t>(data.x.size()) + static_cast<f_t>(data.n_upper_bounds));
+  f_t mu_denom            = static_cast<f_t>(data.x.size()) + static_cast<f_t>(data.n_upper_bounds);
+  if (has_cones) {
+    mu_denom -= static_cast<f_t>(data.cones_->m_c);
+    mu_denom += static_cast<f_t>(data.cones_->K);
+  }
+  mu_aff = complementarity_aff_sum / mu_denom;
   sigma  = std::max(0.0, std::min(1.0, std::pow(mu_aff / mu, 3.0)));
   new_mu = sigma * mu_aff;
 }
@@ -3061,6 +3263,7 @@ template <typename i_t, typename f_t>
 void barrier_solver_t<i_t, f_t>::compute_cc_rhs(iteration_data_t<i_t, f_t>& data, f_t& new_mu)
 {
   raft::common::nvtx::range fun_scope("Barrier: compute_cc_rhs");
+  const bool has_cones = data.cones_.has_value() && data.cones_->K > 0;
 
   cub::DeviceTransform::Transform(
     cuda::std::make_tuple(data.d_dx_aff_.data(), data.d_dz_aff_.data()),
@@ -3076,11 +3279,19 @@ void barrier_solver_t<i_t, f_t>::compute_cc_rhs(iteration_data_t<i_t, f_t>& data
     [new_mu] HD(f_t dw_aff, f_t dv_aff) { return -(dw_aff * dv_aff) + new_mu; },
     stream_view_.value());
   RAFT_CHECK_CUDA(stream_view_);
+  if (has_cones) {
+    thrust::fill_n(rmm::exec_policy(stream_view_),
+                   data.d_complementarity_xz_rhs_.begin() + data.cone_var_start_,
+                   data.cones_->m_c,
+                   f_t(0));
+  }
 
   // TMP should be CPU to 0 if CPU and GPU to 0 if GPU
   data.primal_rhs.set_scalar(0.0);
   data.bound_rhs.set_scalar(0.0);
   data.dual_rhs.set_scalar(0.0);
+  data.cone_combined_step_ = has_cones;
+  data.cone_sigma_mu_      = has_cones ? new_mu : f_t(0);
 }
 
 template <typename i_t, typename f_t>
@@ -3153,12 +3364,33 @@ void barrier_solver_t<i_t, f_t>::compute_primal_dual_step_length(iteration_data_
                                                                  f_t& step_dual)
 {
   raft::common::nvtx::range fun_scope("Barrier: compute_primal_dual_step_length");
+  const bool has_cones = data.cones_.has_value() && data.cones_->K > 0;
+
   f_t max_step_primal = 0.0;
   f_t max_step_dual   = 0.0;
   max_step_primal     = std::min(gpu_max_step_to_boundary(data, data.d_w_, data.d_dw_),
                              gpu_max_step_to_boundary(data, data.d_x_, data.d_dx_));
   max_step_dual       = std::min(gpu_max_step_to_boundary(data, data.d_v_, data.d_dv_),
                            gpu_max_step_to_boundary(data, data.d_z_, data.d_dz_));
+
+  if (has_cones) {
+    i_t cs = data.cone_var_start_;
+    i_t mc = data.cones_->m_c;
+    f_t cone_primal =
+      compute_single_cone_step_length(*data.cones_,
+                                      raft::device_span<const f_t>(data.d_x_.data() + cs, mc),
+                                      raft::device_span<const f_t>(data.d_dx_.data() + cs, mc),
+                                      f_t(1),
+                                      stream_view_);
+    f_t cone_dual =
+      compute_single_cone_step_length(*data.cones_,
+                                      raft::device_span<const f_t>(data.d_z_.data() + cs, mc),
+                                      raft::device_span<const f_t>(data.d_dz_.data() + cs, mc),
+                                      f_t(1),
+                                      stream_view_);
+    max_step_primal = std::min(max_step_primal, cone_primal);
+    max_step_dual   = std::min(max_step_dual, cone_dual);
+  }
 
   step_primal = step_scale * max_step_primal;
   step_dual   = step_scale * max_step_dual;
@@ -3253,6 +3485,13 @@ template <typename i_t, typename f_t>
 void barrier_solver_t<i_t, f_t>::compute_mu(iteration_data_t<i_t, f_t>& data, f_t& mu)
 {
   raft::common::nvtx::range fun_scope("Barrier: compute_mu");
+  const bool has_cones = data.cones_.has_value() && data.cones_->K > 0;
+
+  f_t mu_denom = static_cast<f_t>(data.x.size()) + static_cast<f_t>(data.n_upper_bounds);
+  if (has_cones) {
+    mu_denom -= static_cast<f_t>(data.cones_->m_c);
+    mu_denom += static_cast<f_t>(data.cones_->K);
+  }
 
   mu = (data.sum_reduce_helper_.sum(data.d_complementarity_xz_residual_.begin(),
                                     data.d_complementarity_xz_residual_.size(),
@@ -3260,7 +3499,7 @@ void barrier_solver_t<i_t, f_t>::compute_mu(iteration_data_t<i_t, f_t>& data, f_
         data.sum_reduce_helper_.sum(data.d_complementarity_wv_residual_.begin(),
                                     data.d_complementarity_wv_residual_.size(),
                                     stream_view_)) /
-       (static_cast<f_t>(data.x.size()) + static_cast<f_t>(data.n_upper_bounds));
+       mu_denom;
 }
 
 template <typename i_t, typename f_t>
@@ -3585,8 +3824,13 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time,
     f_t complementarity_residual_norm =
       std::max(vector_norm_inf<i_t, f_t>(data.complementarity_xz_residual, stream_view_),
                vector_norm_inf<i_t, f_t>(data.complementarity_wv_residual, stream_view_));
-    f_t mu = (data.complementarity_xz_residual.sum() + data.complementarity_wv_residual.sum()) /
-             (static_cast<f_t>(n) + static_cast<f_t>(num_upper_bounds));
+    f_t mu_denom = static_cast<f_t>(n) + static_cast<f_t>(num_upper_bounds);
+    if (data.cones_.has_value() && data.cones_->K > 0) {
+      mu_denom -= static_cast<f_t>(data.cones_->m_c);
+      mu_denom += static_cast<f_t>(data.cones_->K);
+    }
+    f_t mu =
+      (data.complementarity_xz_residual.sum() + data.complementarity_wv_residual.sum()) / mu_denom;
 
     f_t norm_b = vector_norm_inf<i_t, f_t>(data.b, stream_view_);
     f_t norm_c = vector_norm_inf<i_t, f_t>(data.c, stream_view_);
@@ -3627,9 +3871,14 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time,
                         relative_complementarity_residual,
                         elapsed_time);
 
+    f_t duality_gap_abs = std::abs(primal_objective - dual_objective);
+    f_t duality_gap_rel =
+      duality_gap_abs /
+      std::max(f_t(1), std::min(std::abs(primal_objective), std::abs(dual_objective)));
     bool converged = primal_residual_norm < settings.barrier_relative_feasibility_tol &&
                      dual_residual_norm < settings.barrier_relative_optimality_tol &&
-                     complementarity_residual_norm < settings.barrier_relative_complementarity_tol;
+                     (duality_gap_abs < settings.barrier_relative_complementarity_tol ||
+                      duality_gap_rel < settings.barrier_relative_complementarity_tol);
 
     data.d_complementarity_xz_residual_.resize(data.complementarity_xz_residual.size(),
                                                stream_view_);

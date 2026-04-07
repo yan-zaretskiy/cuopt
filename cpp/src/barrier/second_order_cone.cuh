@@ -765,6 +765,33 @@ __global__ __launch_bounds__(BLOCK_DIM) void step_length_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Single-variable cone step length kernel (one block per cone).
+// Like step_length_kernel but only checks u + alpha*du in Q^{q_i}.
+// ---------------------------------------------------------------------------
+template <typename i_t, typename f_t, int BLOCK_DIM>
+__global__ __launch_bounds__(BLOCK_DIM) void step_length_single_kernel(
+  raft::device_span<const f_t> u,
+  raft::device_span<const f_t> du,
+  raft::device_span<f_t> alpha,
+  raft::device_span<const i_t> cone_offsets,
+  i_t K,
+  f_t alpha_max)
+{
+  __shared__ typename block_reduce_t<triplet_t<f_t>, BLOCK_DIM>::TempStorage temp_storage;
+
+  i_t cone = static_cast<i_t>(blockIdx.x);
+  if (cone >= K) return;
+
+  i_t off = cone_offsets[cone];
+  i_t q   = cone_offsets[cone + 1] - off;
+
+  f_t a = cone_step_length_single<i_t, f_t, BLOCK_DIM>(
+    u.subspan(off, q), du.subspan(off, q), temp_storage, alpha_max);
+
+  if (threadIdx.x == 0) { alpha[cone] = a; }
+}
+
+// ---------------------------------------------------------------------------
 // Shift u into int(Q^q) if it is not already interior (one block per cone).
 //
 // alpha(u) = ||u_1|| - u_0.  If alpha >= 0 (u on boundary or outside):
@@ -893,6 +920,104 @@ struct cone_data_t {
   }
 };
 
+template <typename i_t, typename f_t>
+void compute_affine_cone_rhs_term(const cone_data_t<i_t, f_t>& cones,
+                                  rmm::device_uvector<f_t>& out,
+                                  rmm::cuda_stream_view stream)
+{
+  out.resize(cones.m_c, stream);
+  if (cones.K == 0) return;
+
+  apply_Hinv2_kernel<i_t, f_t, medium_block_dim>
+    <<<cones.K, medium_block_dim, 0, stream>>>(cones.s,
+                                               cuopt::make_span(out),
+                                               cuopt::make_span(cones.w_bar),
+                                               cuopt::make_span(cones.inv_eta),
+                                               cuopt::make_span(cones.cone_offsets),
+                                               cones.K);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename i_t, typename f_t>
+void compute_combined_cone_rhs_term(raft::device_span<const f_t> dx_aff,
+                                    const cone_data_t<i_t, f_t>& cones,
+                                    f_t sigma_mu,
+                                    rmm::device_uvector<f_t>& out,
+                                    rmm::cuda_stream_view stream)
+{
+  out.resize(cones.m_c, stream);
+  if (cones.K == 0) return;
+
+  fused_corrector_kernel<i_t, f_t, medium_block_dim>
+    <<<cones.K, medium_block_dim, 0, stream>>>(dx_aff,
+                                               cuopt::make_span(cones.omega),
+                                               cuopt::make_span(cones.w_bar),
+                                               cuopt::make_span(cones.inv_eta),
+                                               cuopt::make_span(cones.inv_1pw0),
+                                               cuopt::make_span(cones.rho),
+                                               sigma_mu,
+                                               cuopt::make_span(out),
+                                               cuopt::make_span(cones.cone_offsets),
+                                               cones.K);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename i_t, typename f_t>
+void recover_cone_dz(raft::device_span<const f_t> dx,
+                     const cone_data_t<i_t, f_t>& cones,
+                     const rmm::device_uvector<f_t>& cone_rhs_term,
+                     rmm::device_uvector<f_t>& hinv2_dx,
+                     raft::device_span<f_t> dz,
+                     rmm::cuda_stream_view stream)
+{
+  hinv2_dx.resize(cones.m_c, stream);
+  if (cones.K == 0) return;
+
+  apply_Hinv2_kernel<i_t, f_t, medium_block_dim>
+    <<<cones.K, medium_block_dim, 0, stream>>>(dx,
+                                               cuopt::make_span(hinv2_dx),
+                                               cuopt::make_span(cones.w_bar),
+                                               cuopt::make_span(cones.inv_eta),
+                                               cuopt::make_span(cones.cone_offsets),
+                                               cones.K);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  thrust::for_each_n(
+    rmm::exec_policy(stream),
+    thrust::make_counting_iterator<i_t>(0),
+    cones.m_c,
+    [span_rhs   = cuopt::make_span(cone_rhs_term),
+     span_hinv2 = cuopt::make_span(hinv2_dx),
+     span_dz    = dz] __device__(i_t j) { span_dz[j] = -span_rhs[j] - span_hinv2[j]; });
+}
+
+template <typename i_t, typename f_t>
+void accumulate_cone_hinv2_matvec(raft::device_span<const f_t> x,
+                                  const cone_data_t<i_t, f_t>& cones,
+                                  rmm::device_uvector<f_t>& hinv2_x,
+                                  raft::device_span<f_t> out,
+                                  rmm::cuda_stream_view stream)
+{
+  hinv2_x.resize(cones.m_c, stream);
+  if (cones.K == 0) return;
+
+  apply_Hinv2_kernel<i_t, f_t, medium_block_dim>
+    <<<cones.K, medium_block_dim, 0, stream>>>(x,
+                                               cuopt::make_span(hinv2_x),
+                                               cuopt::make_span(cones.w_bar),
+                                               cuopt::make_span(cones.inv_eta),
+                                               cuopt::make_span(cones.cone_offsets),
+                                               cones.K);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  thrust::for_each_n(rmm::exec_policy(stream),
+                     thrust::make_counting_iterator<i_t>(0),
+                     cones.m_c,
+                     [span_hinv2 = cuopt::make_span(hinv2_x), span_out = out] __device__(i_t j) {
+                       span_out[j] += span_hinv2[j];
+                     });
+}
+
 // ---------------------------------------------------------------------------
 // Compute flat H^{-2} cone-block entries and scatter them into the augmented
 // CSR value array.
@@ -954,6 +1079,74 @@ void scatter_hinv2_into_augmented(const cone_data_t<i_t, f_t>& cones,
 
   thrust::scatter(
     rmm::exec_policy(stream), values, values + count, csr_indices.begin(), augmented_x.begin());
+}
+
+// ---------------------------------------------------------------------------
+// Compute the maximum feasible step length for the cone portion of (x, z).
+//
+// Launches step_length_kernel (one CTA per cone), then reduces the per-cone
+// results to a single scalar.  Returns min over all cones of the step length
+// that keeps both x_K + alpha*dx_K and z_K + alpha*dz_K in their cones.
+// ---------------------------------------------------------------------------
+template <typename i_t, typename f_t>
+f_t compute_cone_step_length(const cone_data_t<i_t, f_t>& cones,
+                             raft::device_span<const f_t> x_K,
+                             raft::device_span<const f_t> dx_K,
+                             raft::device_span<const f_t> z_K,
+                             raft::device_span<const f_t> dz_K,
+                             f_t alpha_max,
+                             rmm::cuda_stream_view stream)
+{
+  if (cones.K == 0) return alpha_max;
+
+  rmm::device_uvector<f_t> d_alpha(cones.K, stream);
+  step_length_kernel<i_t, f_t, medium_block_dim>
+    <<<cones.K, medium_block_dim, 0, stream>>>(x_K,
+                                               dx_K,
+                                               z_K,
+                                               dz_K,
+                                               cuopt::make_span(d_alpha),
+                                               cuopt::make_span(cones.cone_offsets),
+                                               cones.K,
+                                               alpha_max);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  f_t result = thrust::reduce(
+    rmm::exec_policy(stream), d_alpha.begin(), d_alpha.end(), alpha_max, thrust::minimum<f_t>());
+  return result;
+}
+
+template <typename i_t, typename f_t>
+f_t compute_single_cone_step_length(const cone_data_t<i_t, f_t>& cones,
+                                    raft::device_span<const f_t> u_K,
+                                    raft::device_span<const f_t> du_K,
+                                    f_t alpha_max,
+                                    rmm::cuda_stream_view stream)
+{
+  if (cones.K == 0) return alpha_max;
+
+  rmm::device_uvector<f_t> d_alpha(cones.K, stream);
+  step_length_single_kernel<i_t, f_t, medium_block_dim><<<cones.K, medium_block_dim, 0, stream>>>(
+    u_K, du_K, cuopt::make_span(d_alpha), cuopt::make_span(cones.cone_offsets), cones.K, alpha_max);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  return thrust::reduce(
+    rmm::exec_policy(stream), d_alpha.begin(), d_alpha.end(), alpha_max, thrust::minimum<f_t>());
+}
+
+// ---------------------------------------------------------------------------
+// Shift cone slices of a vector into the strict interior of their cones.
+// Operates on a subspan of the global vector (pre-sliced to cone portion).
+// ---------------------------------------------------------------------------
+template <typename i_t, typename f_t>
+void launch_interior_shift(raft::device_span<f_t> u_K,
+                           const cone_data_t<i_t, f_t>& cones,
+                           rmm::cuda_stream_view stream)
+{
+  if (cones.K == 0) return;
+  interior_shift_kernel<i_t, f_t, medium_block_dim>
+    <<<cones.K, medium_block_dim, 0, stream>>>(u_K, cuopt::make_span(cones.cone_offsets), cones.K);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
 template <typename i_t, typename f_t>

@@ -49,6 +49,8 @@ struct lp_problem_t {
   f_t obj_constant;
   f_t obj_scale;  // 1.0 for min, -1.0 for max
   bool objective_is_integral{false};
+  i_t cone_var_start{0};
+  std::vector<i_t> second_order_cone_dims;
 
   void write_problem(const std::string& path) const
   {

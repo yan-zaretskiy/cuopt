@@ -345,6 +345,26 @@ lp_status_t solve_linear_program_with_barrier(const user_problem_t<i_t, f_t>& us
   barrier_settings.barrier_presolve                    = true;
   dualize_info_t<i_t, f_t> dualize_info;
   convert_user_problem(user_problem, barrier_settings, original_lp, new_slacks, dualize_info);
+
+  if (!user_problem.second_order_cone_dims.empty()) {
+    i_t cone_end = user_problem.cone_var_start;
+    for (auto q_k : user_problem.second_order_cone_dims) {
+      cone_end += q_k;
+    }
+    for (i_t j = user_problem.cone_var_start; j < cone_end; ++j) {
+      if (user_problem.lower[j] != 0.0 && user_problem.lower[j] > -1e30) {
+        settings.log.printf("Error: explicit lower bound on conic variable %d is not supported\n",
+                            j);
+        return lp_status_t::NUMERICAL_ISSUES;
+      }
+      if (user_problem.upper[j] < 1e30) {
+        settings.log.printf("Error: explicit upper bound on conic variable %d is not supported\n",
+                            j);
+        return lp_status_t::NUMERICAL_ISSUES;
+      }
+    }
+  }
+
   lp_solution_t<i_t, f_t> lp_solution(original_lp.num_rows, original_lp.num_cols);
 
   // Presolve the linear program
