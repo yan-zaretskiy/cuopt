@@ -614,8 +614,7 @@ TEST_F(second_order_cone_test, cone_data_reuses_named_scratch_slots)
 
 TEST_F(second_order_cone_test, nt_scaling_matches_reference_for_small_cone)
 {
-  // Borrowed from the Clarabel regression input, but checked against our own
-  // host-side NT formulas.
+  // Fixed small-cone fixture validated against the host-side NT formulas.
   std::vector<std::vector<f_t>> s_cones{{1.5, 0.3, 0.4}};
   std::vector<std::vector<f_t>> lambda_cones{{2.0, 0.5, 0.5}};
   std::vector<i_t> dims{3};
@@ -855,15 +854,15 @@ TEST_F(second_order_cone_test, step_length_matches_reference_for_large_cone)
   EXPECT_LT(actual_alpha[0], alpha_max);
 }
 
-TEST_F(second_order_cone_test, step_length_boundary_c_zero_matches_clarabel_branch)
+TEST_F(second_order_cone_test, step_length_boundary_c_zero_returns_zero)
 {
   std::vector<i_t> dims{3};
   auto offsets = build_offsets(dims);
 
   // Boundary point: c = u^T J u = 1^2 - 1^2 - 0^2 = 0.
   // Direction: a = du^T J du = 1^2 - 1^2 - 1^2 = -1 < 0.
-  // Clarabel's c == 0 branch returns 0 in this case because the direction
-  // leaves the cone immediately.
+  // The step length is 0 in this case because the direction leaves the cone
+  // immediately.
   std::vector<std::vector<f_t>> s_cones{{1.0, 1.0, 0.0}};
   std::vector<std::vector<f_t>> ds_cones{{1.0, 1.0, 1.0}};
   std::vector<std::vector<f_t>> lambda_cones{{1.0, 1.0, 0.0}};

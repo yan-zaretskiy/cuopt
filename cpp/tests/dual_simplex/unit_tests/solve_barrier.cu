@@ -5,8 +5,6 @@
  */
 /* clang-format on */
 
-#include <cstdio>
-
 #include <utilities/common_utils.hpp>
 
 #include <gtest/gtest.h>
@@ -32,6 +30,72 @@ static void init_handler(const raft::handle_t* handle_ptr)
     handle_ptr->get_cublas_handle(), CUBLAS_POINTER_MODE_DEVICE, handle_ptr->get_stream()));
   RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsesetpointermode(
     handle_ptr->get_cusparse_handle(), CUSPARSE_POINTER_MODE_DEVICE, handle_ptr->get_stream()));
+}
+
+template <typename i_t, typename f_t>
+static void populate_basic_qp_socp_problem(user_problem_t<i_t, f_t>& user_problem,
+                                           bool explicit_cone_variables)
+{
+  constexpr i_t num_rows = 9;
+  constexpr f_t p00      = static_cast<f_t>(1.4652521089139698);
+  constexpr f_t p01      = static_cast<f_t>(0.6137176286085666);
+  constexpr f_t p02      = static_cast<f_t>(-1.1527861771130112);
+  constexpr f_t p11      = static_cast<f_t>(2.219109946678485);
+  constexpr f_t p12      = static_cast<f_t>(-1.4400420548730628);
+  constexpr f_t p22      = static_cast<f_t>(1.6014483534926371);
+
+  user_problem.num_rows       = num_rows;
+  user_problem.rhs            = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0};
+  user_problem.row_sense      = {'L', 'L', 'L', 'L', 'L', 'L', 'E', 'E', 'E'};
+  user_problem.num_range_rows = 0;
+
+  if (explicit_cone_variables) {
+    user_problem.num_cols  = 6;
+    user_problem.objective = {0.1, -2.0, 1.0, 0.0, 0.0, 0.0};
+
+    user_problem.A.m      = num_rows;
+    user_problem.A.n      = user_problem.num_cols;
+    user_problem.A.nz_max = 12;
+    user_problem.A.reallocate(12);
+    user_problem.A.col_start = {0, 3, 6, 9, 10, 11, 12};
+    user_problem.A.i         = {0, 3, 6, 1, 4, 7, 2, 5, 8, 6, 7, 8};
+    user_problem.A.x         = {2.0, -2.0, 1.0, 2.0, -2.0, 1.0, 2.0, -2.0, 1.0, 1.0, 1.0, 1.0};
+
+    user_problem.lower = {-inf, -inf, -inf, 0.0, 0.0, 0.0};
+    user_problem.upper.assign(user_problem.num_cols, inf);
+
+    user_problem.Q_offsets = {0, 3, 6, 9, 9, 9, 9};
+    user_problem.Q_indices = {0, 1, 2, 0, 1, 2, 0, 1, 2};
+    user_problem.Q_values  = {p00, p01, p02, p01, p11, p12, p02, p12, p22};
+
+    user_problem.cone_var_start         = 3;
+    user_problem.second_order_cone_dims = {3};
+    user_problem.problem_name           = "basic_qp_socp_explicit_cone";
+  } else {
+    user_problem.num_cols  = 3;
+    user_problem.objective = {0.1, -2.0, 1.0};
+
+    user_problem.A.m      = num_rows;
+    user_problem.A.n      = user_problem.num_cols;
+    user_problem.A.nz_max = 9;
+    user_problem.A.reallocate(9);
+    user_problem.A.col_start = {0, 3, 6, 9};
+    user_problem.A.i         = {0, 3, 6, 1, 4, 7, 2, 5, 8};
+    user_problem.A.x         = {2.0, -2.0, 1.0, 2.0, -2.0, 1.0, 2.0, -2.0, 1.0};
+
+    user_problem.lower.assign(user_problem.num_cols, -inf);
+    user_problem.upper.assign(user_problem.num_cols, inf);
+
+    user_problem.Q_offsets = {0, 3, 6, 9};
+    user_problem.Q_indices = {0, 1, 2, 0, 1, 2, 0, 1, 2};
+    user_problem.Q_values  = {p00, p01, p02, p01, p11, p12, p02, p12, p22};
+
+    user_problem.cone_row_start             = 6;
+    user_problem.second_order_cone_row_dims = {3};
+    user_problem.problem_name               = "basic_qp_socp_row_cone";
+  }
+
+  user_problem.var_types.assign(user_problem.num_cols, variable_type_t::CONTINUOUS);
 }
 
 TEST(barrier, chess_set)
@@ -140,7 +204,6 @@ TEST(barrier, dual_variable_greater_than)
   user_problem.A.x[nnz++] = 1.0;
   user_problem.A.i[nnz]   = 1;
   user_problem.A.x[nnz++] = 2.0;
-  user_problem.A.print_matrix();
   EXPECT_EQ(nnz, nz);
 
   user_problem.rhs.resize(m);
@@ -210,7 +273,7 @@ TEST(barrier, cone_metadata_reindexed_when_slack_is_inserted_before_cones)
 
   simplex_solver_settings_t<int, double> settings;
   settings.barrier          = true;
-  settings.barrier_presolve = false;
+  settings.barrier_presolve = true;
   settings.dualize          = 0;
   settings.scale_columns    = false;
 
@@ -234,6 +297,225 @@ TEST(barrier, cone_metadata_reindexed_when_slack_is_inserted_before_cones)
 
   EXPECT_EQ(barrier_lp.second_order_cone_dims, user_problem.second_order_cone_dims);
   EXPECT_EQ(barrier_lp.cone_var_start, 2);
+}
+
+TEST(barrier, row_cone_block_is_lifted_into_trailing_cone_variables)
+{
+  raft::handle_t handle{};
+  init_handler(&handle);
+
+  using namespace cuopt::linear_programming::dual_simplex;
+  user_problem_t<int, double> user_problem(&handle);
+
+  constexpr int m  = 3;
+  constexpr int n  = 2;
+  constexpr int nz = 4;
+
+  user_problem.num_rows  = m;
+  user_problem.num_cols  = n;
+  user_problem.objective = {0.0, 0.0};
+
+  user_problem.A.m      = m;
+  user_problem.A.n      = n;
+  user_problem.A.nz_max = nz;
+  user_problem.A.reallocate(nz);
+  user_problem.A.col_start = {0, 2, 4};
+  user_problem.A.i[0]      = 0;
+  user_problem.A.x[0]      = 1.0;
+  user_problem.A.i[1]      = 2;
+  user_problem.A.x[1]      = 1.0;
+  user_problem.A.i[2]      = 1;
+  user_problem.A.x[2]      = -1.0;
+  user_problem.A.i[3]      = 2;
+  user_problem.A.x[3]      = 2.0;
+
+  user_problem.rhs       = {3.0, 1.0, 4.0};
+  user_problem.row_sense = {'E', 'E', 'E'};
+  user_problem.lower.assign(n, 0.0);
+  user_problem.upper.assign(n, inf);
+  user_problem.num_range_rows             = 0;
+  user_problem.cone_row_start             = 0;
+  user_problem.second_order_cone_row_dims = {3};
+
+  simplex_solver_settings_t<int, double> settings;
+  settings.barrier          = true;
+  settings.barrier_presolve = true;
+  settings.dualize          = 0;
+  settings.scale_columns    = false;
+
+  std::vector<int> new_slacks;
+  dualize_info_t<int, double> dualize_info;
+  lp_problem_t<int, double> original_lp(user_problem.handle_ptr, 1, 1, 1);
+  convert_user_problem(user_problem, settings, original_lp, new_slacks, dualize_info);
+
+  EXPECT_TRUE(new_slacks.empty());
+  EXPECT_EQ(original_lp.num_cols, 5);
+  EXPECT_EQ(original_lp.cone_var_start, 2);
+  EXPECT_EQ(original_lp.second_order_cone_dims, std::vector<int>({3}));
+
+  for (int j = 2; j < 5; ++j) {
+    EXPECT_EQ(original_lp.A.col_start[j + 1] - original_lp.A.col_start[j], 1);
+    EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[j]], j - 2);
+    EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[j]], 1.0);
+    EXPECT_EQ(original_lp.objective[j], 0.0);
+    EXPECT_EQ(original_lp.lower[j], 0.0);
+    EXPECT_EQ(original_lp.upper[j], inf);
+  }
+}
+
+TEST(barrier, row_cone_block_and_scalar_inequality_order_as_linear_slack_then_cone)
+{
+  raft::handle_t handle{};
+  init_handler(&handle);
+
+  using namespace cuopt::linear_programming::dual_simplex;
+  user_problem_t<int, double> user_problem(&handle);
+
+  constexpr int m  = 4;
+  constexpr int n  = 1;
+  constexpr int nz = 2;
+
+  user_problem.num_rows  = m;
+  user_problem.num_cols  = n;
+  user_problem.objective = {1.0};
+
+  user_problem.A.m      = m;
+  user_problem.A.n      = n;
+  user_problem.A.nz_max = nz;
+  user_problem.A.reallocate(nz);
+  user_problem.A.col_start = {0, 2};
+  user_problem.A.i[0]      = 0;
+  user_problem.A.x[0]      = 1.0;
+  user_problem.A.i[1]      = 1;
+  user_problem.A.x[1]      = -1.0;
+
+  user_problem.rhs                        = {2.0, 0.0, 1.0, 0.0};
+  user_problem.row_sense                  = {'L', 'E', 'E', 'E'};
+  user_problem.lower                      = {0.0};
+  user_problem.upper                      = {inf};
+  user_problem.num_range_rows             = 0;
+  user_problem.cone_row_start             = 1;
+  user_problem.second_order_cone_row_dims = {3};
+
+  simplex_solver_settings_t<int, double> settings;
+  settings.barrier          = true;
+  settings.barrier_presolve = true;
+  settings.dualize          = 0;
+  settings.scale_columns    = false;
+
+  std::vector<int> new_slacks;
+  dualize_info_t<int, double> dualize_info;
+  lp_problem_t<int, double> original_lp(user_problem.handle_ptr, 1, 1, 1);
+  convert_user_problem(user_problem, settings, original_lp, new_slacks, dualize_info);
+
+  ASSERT_EQ(new_slacks.size(), 1);
+  EXPECT_EQ(new_slacks[0], 1);
+  EXPECT_EQ(original_lp.num_cols, 5);
+  EXPECT_EQ(original_lp.cone_var_start, 2);
+  EXPECT_EQ(original_lp.second_order_cone_dims, std::vector<int>({3}));
+
+  EXPECT_EQ(original_lp.A.col_start[1] - original_lp.A.col_start[0], 2);
+  EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[0]], 0);
+  EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[0]], 1.0);
+  EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[0] + 1], 1);
+  EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[0] + 1], -1.0);
+
+  EXPECT_EQ(original_lp.A.col_start[2] - original_lp.A.col_start[1], 1);
+  EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[1]], 0);
+  EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[1]], 1.0);
+
+  for (int j = 2; j < 5; ++j) {
+    EXPECT_EQ(original_lp.A.col_start[j + 1] - original_lp.A.col_start[j], 1);
+    EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[j]], j - 1);
+    EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[j]], 1.0);
+    EXPECT_EQ(original_lp.objective[j], 0.0);
+    EXPECT_EQ(original_lp.lower[j], 0.0);
+    EXPECT_EQ(original_lp.upper[j], inf);
+  }
+}
+
+TEST(barrier, explicit_and_lifted_cones_stay_contiguous_after_scalar_slack_insertion)
+{
+  raft::handle_t handle{};
+  init_handler(&handle);
+
+  using namespace cuopt::linear_programming::dual_simplex;
+  user_problem_t<int, double> user_problem(&handle);
+
+  constexpr int m  = 4;
+  constexpr int n  = 4;
+  constexpr int nz = 5;
+
+  user_problem.num_rows  = m;
+  user_problem.num_cols  = n;
+  user_problem.objective = {0.0, 0.0, 0.0, 0.0};
+
+  user_problem.A.m      = m;
+  user_problem.A.n      = n;
+  user_problem.A.nz_max = nz;
+  user_problem.A.reallocate(nz);
+  user_problem.A.col_start = {0, 2, 3, 4, 5};
+  user_problem.A.i[0]      = 0;
+  user_problem.A.x[0]      = 1.0;
+  user_problem.A.i[1]      = 1;
+  user_problem.A.x[1]      = -1.0;
+  user_problem.A.i[2]      = 1;
+  user_problem.A.x[2]      = 1.0;
+  user_problem.A.i[3]      = 2;
+  user_problem.A.x[3]      = 2.0;
+  user_problem.A.i[4]      = 3;
+  user_problem.A.x[4]      = -3.0;
+
+  user_problem.rhs       = {2.0, 0.0, 0.0, 0.0};
+  user_problem.row_sense = {'L', 'E', 'E', 'E'};
+  user_problem.lower.assign(n, 0.0);
+  user_problem.upper.assign(n, inf);
+  user_problem.num_range_rows             = 0;
+  user_problem.cone_var_start             = 1;
+  user_problem.second_order_cone_dims     = {3};
+  user_problem.cone_row_start             = 1;
+  user_problem.second_order_cone_row_dims = {3};
+  user_problem.var_types.assign(n, variable_type_t::CONTINUOUS);
+
+  simplex_solver_settings_t<int, double> settings;
+  settings.barrier          = true;
+  settings.barrier_presolve = true;
+  settings.dualize          = 0;
+  settings.scale_columns    = false;
+
+  std::vector<int> new_slacks;
+  dualize_info_t<int, double> dualize_info;
+  lp_problem_t<int, double> original_lp(user_problem.handle_ptr, 1, 1, 1);
+  convert_user_problem(user_problem, settings, original_lp, new_slacks, dualize_info);
+
+  ASSERT_EQ(new_slacks.size(), 1);
+  EXPECT_EQ(new_slacks[0], 1);
+  EXPECT_EQ(original_lp.num_cols, 8);
+  EXPECT_EQ(original_lp.cone_var_start, 2);
+  EXPECT_EQ(original_lp.second_order_cone_dims, std::vector<int>({3, 3}));
+
+  EXPECT_EQ(original_lp.A.col_start[2] - original_lp.A.col_start[1], 1);
+  EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[1]], 0);
+  EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[1]], 1.0);
+
+  EXPECT_EQ(original_lp.A.col_start[3] - original_lp.A.col_start[2], 1);
+  EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[2]], 1);
+  EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[2]], 1.0);
+  EXPECT_EQ(original_lp.A.col_start[4] - original_lp.A.col_start[3], 1);
+  EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[3]], 2);
+  EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[3]], 2.0);
+  EXPECT_EQ(original_lp.A.col_start[5] - original_lp.A.col_start[4], 1);
+  EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[4]], 3);
+  EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[4]], -3.0);
+
+  for (int j = 5; j < 8; ++j) {
+    EXPECT_EQ(original_lp.A.col_start[j + 1] - original_lp.A.col_start[j], 1);
+    EXPECT_EQ(original_lp.A.i[original_lp.A.col_start[j]], j - 4);
+    EXPECT_EQ(original_lp.A.x[original_lp.A.col_start[j]], 1.0);
+    EXPECT_EQ(original_lp.objective[j], 0.0);
+    EXPECT_EQ(original_lp.lower[j], 0.0);
+    EXPECT_EQ(original_lp.upper[j], inf);
+  }
 }
 
 TEST(barrier, presolve_reindexes_cone_start_after_empty_column_removal)
@@ -487,27 +769,131 @@ TEST(barrier, socp_min_x0_subject_to_norm_constraint)
   settings.barrier          = true;
   settings.barrier_presolve = false;
   settings.dualize          = 0;
-  settings.set_log(true);
-  settings.log.log_to_console = false;
-  settings.log.enable_log_to_file();
-  settings.log.set_log_file("/tmp/socp_barrier_test.log");
 
   lp_solution_t<int, double> solution(m, n);
-  printf("=== Calling solve_linear_program_with_barrier ===\n");
-  fflush(stdout);
   auto status = solve_linear_program_with_barrier(user_problem, settings, solution);
-  printf("=== status=%d obj=%e x=[%e %e %e] ===\n",
-         static_cast<int>(status),
-         solution.objective,
-         solution.x[0],
-         solution.x[1],
-         solution.x[2]);
-  fflush(stdout);
   EXPECT_EQ(status, lp_status_t::OPTIMAL);
   EXPECT_NEAR(solution.objective, 1.0, 1e-4);
   EXPECT_NEAR(solution.x[0], 1.0, 1e-4);
   EXPECT_NEAR(solution.x[1], 1.0, 1e-4);
   EXPECT_NEAR(std::abs(solution.x[2]), 0.0, 1e-4);
+}
+
+TEST(barrier, socp_min_x_subject_to_row_cone_metadata)
+{
+  // minimize x
+  // subject to -x + s_0 = 0
+  //                 s_1 = 1
+  //                 s_2 = 0
+  //            (s_0, s_1, s_2) in Q^3
+  //
+  // Optimal: x* = 1, obj* = 1.
+
+  raft::handle_t handle{};
+  init_handler(&handle);
+
+  using namespace cuopt::linear_programming::dual_simplex;
+  user_problem_t<int, double> user_problem(&handle);
+
+  constexpr int m  = 3;
+  constexpr int n  = 1;
+  constexpr int nz = 1;
+
+  user_problem.num_rows  = m;
+  user_problem.num_cols  = n;
+  user_problem.objective = {1.0};
+
+  user_problem.A.m      = m;
+  user_problem.A.n      = n;
+  user_problem.A.nz_max = nz;
+  user_problem.A.reallocate(nz);
+  user_problem.A.col_start = {0, 1};
+  user_problem.A.i[0]      = 0;
+  user_problem.A.x[0]      = -1.0;
+
+  user_problem.rhs                        = {0.0, 1.0, 0.0};
+  user_problem.row_sense                  = {'E', 'E', 'E'};
+  user_problem.lower                      = {0.0};
+  user_problem.upper                      = {inf};
+  user_problem.num_range_rows             = 0;
+  user_problem.problem_name               = "socp_row_cone_metadata";
+  user_problem.cone_row_start             = 0;
+  user_problem.second_order_cone_row_dims = {3};
+  user_problem.var_types.assign(n, variable_type_t::CONTINUOUS);
+
+  simplex_solver_settings_t<int, double> settings;
+  settings.barrier          = true;
+  settings.barrier_presolve = false;
+  settings.dualize          = 0;
+  settings.scale_columns    = false;
+
+  lp_solution_t<int, double> solution(m, n);
+  auto status = solve_linear_program_with_barrier(user_problem, settings, solution);
+
+  EXPECT_EQ(status, lp_status_t::OPTIMAL);
+  EXPECT_NEAR(solution.objective, 1.0, 1e-4);
+  EXPECT_NEAR(solution.x[0], 1.0, 1e-4);
+}
+
+TEST(barrier, basic_qp_socp_row_cone_matches_reference_solution)
+{
+  raft::handle_t handle{};
+  init_handler(&handle);
+
+  using namespace cuopt::linear_programming::dual_simplex;
+  user_problem_t<int, double> user_problem(&handle);
+  populate_basic_qp_socp_problem(user_problem, false);
+
+  simplex_solver_settings_t<int, double> settings;
+  settings.barrier          = true;
+  settings.barrier_presolve = false;
+  settings.dualize          = 0;
+  settings.scale_columns    = false;
+
+  lp_solution_t<int, double> solution(user_problem.num_rows, user_problem.num_cols);
+  auto status = solve_linear_program_with_barrier(user_problem, settings, solution);
+
+  EXPECT_EQ(status, lp_status_t::OPTIMAL);
+  EXPECT_NEAR(solution.x[0], -0.5, 1e-3);
+  EXPECT_NEAR(solution.x[1], 0.435603, 1e-3);
+  EXPECT_NEAR(solution.x[2], -0.245459, 1e-3);
+  EXPECT_NEAR(solution.objective, -0.84590, 1e-3);
+}
+
+TEST(barrier, basic_qp_socp_row_cone_matches_explicit_cone_formulation)
+{
+  raft::handle_t handle{};
+  init_handler(&handle);
+
+  using namespace cuopt::linear_programming::dual_simplex;
+  user_problem_t<int, double> row_cone_problem(&handle);
+  user_problem_t<int, double> explicit_cone_problem(&handle);
+  populate_basic_qp_socp_problem(row_cone_problem, false);
+  populate_basic_qp_socp_problem(explicit_cone_problem, true);
+
+  simplex_solver_settings_t<int, double> settings;
+  settings.barrier          = true;
+  settings.barrier_presolve = false;
+  settings.dualize          = 0;
+  settings.scale_columns    = false;
+
+  lp_solution_t<int, double> row_cone_solution(row_cone_problem.num_rows,
+                                               row_cone_problem.num_cols);
+  lp_solution_t<int, double> explicit_cone_solution(explicit_cone_problem.num_rows,
+                                                    explicit_cone_problem.num_cols);
+
+  auto row_cone_status =
+    solve_linear_program_with_barrier(row_cone_problem, settings, row_cone_solution);
+  auto explicit_status =
+    solve_linear_program_with_barrier(explicit_cone_problem, settings, explicit_cone_solution);
+
+  EXPECT_EQ(row_cone_status, lp_status_t::OPTIMAL);
+  EXPECT_EQ(explicit_status, lp_status_t::OPTIMAL);
+  EXPECT_NEAR(row_cone_solution.objective, explicit_cone_solution.objective, 1e-4);
+  EXPECT_NEAR(row_cone_solution.objective, -0.84590, 1e-3);
+  for (int j = 0; j < 3; ++j) {
+    EXPECT_NEAR(row_cone_solution.x[j], explicit_cone_solution.x[j], 1e-4);
+  }
 }
 
 TEST(barrier, mixed_linear_and_soc_block)

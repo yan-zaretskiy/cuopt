@@ -2048,7 +2048,7 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
         data.v[k] = -c[j] + epsilon;
       }
     }
-    // Now hande the case with no upper bounds (skip cone variables)
+    // Now handle the case with no upper bounds (skip cone variables)
     const i_t cone_end = has_cones ? data.cone_var_start_ + data.cones_->m_c : 0;
     for (i_t j = 0; j < lp.num_cols; j++) {
       if (has_cones && j >= data.cone_var_start_ && j < cone_end) continue;

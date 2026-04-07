@@ -54,6 +54,8 @@ struct user_problem_t {
   std::vector<f_t> Q_values;
   i_t cone_var_start{0};
   std::vector<i_t> second_order_cone_dims;
+  i_t cone_row_start{0};
+  std::vector<i_t> second_order_cone_row_dims;
 };
 
 }  // namespace cuopt::linear_programming::dual_simplex
