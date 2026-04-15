@@ -229,6 +229,9 @@ void mps_data_model_t<i_t, f_t>::append_quadratic_constraint_matrix(i_t constrai
                                                                     const i_t* Qc_offsets,
                                                                     i_t size_offsets)
 {
+  mps_parser_expects(
+    constraint_row_index >= 0, error_type_t::ValidationError, "constraint_row_index must be non-negative");
+    
   if (size_values != 0) {
     mps_parser_expects(
       Qc_values != nullptr, error_type_t::ValidationError, "Qc_values cannot be null");

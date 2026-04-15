@@ -1406,9 +1406,23 @@ void mps_parser_t<i_t, f_t>::parse_qcmatrix_data(std::string_view line)
     i_t pos = 24;
     value   = get_numerical_bound<false>(line, pos);
   } else {
-    std::stringstream ss{std::string(line)};
-    ss >> var1_name >> var2_name >> value;
-    if (var1_name[0] == '$' || var2_name[0] == '$') return;
+    i_t pos = 0;
+    i_t end = 0;
+    const std::string_view var1_sv = get_next_string(line, pos, end);
+    mps_parser_expects(!var1_sv.empty(),
+                       error_type_t::ValidationError,
+                       "QCMATRIX data line missing first variable name! line=%s",
+                       std::string(line).c_str());
+    if (var1_sv[0] == '$') return;
+    const std::string_view var2_sv = get_next_string(line, pos, end);
+    mps_parser_expects(!var2_sv.empty(),
+                       error_type_t::ValidationError,
+                       "QCMATRIX data line missing second variable name! line=%s",
+                       std::string(line).c_str());
+    if (var2_sv[0] == '$') return;
+    value     = get_numerical_bound<false>(line, end);
+    var1_name = std::string(var1_sv);
+    var2_name = std::string(var2_sv);
   }
 
   auto var1_it = var_names_map.find(var1_name);
@@ -1450,9 +1464,23 @@ void mps_parser_t<i_t, f_t>::parse_quad(std::string_view line, bool is_quadobj)
     i_t pos = 24;
     value   = get_numerical_bound<false>(line, pos);
   } else {
-    std::stringstream ss{std::string(line)};
-    ss >> var1_name >> var2_name >> value;
-    if (var1_name[0] == '$' || var2_name[0] == '$') return;
+    i_t pos = 0;
+    i_t end = 0;
+    const std::string_view var1_sv = get_next_string(line, pos, end);
+    mps_parser_expects(!var1_sv.empty(),
+                       error_type_t::ValidationError,
+                       "QUADOBJ/QMATRIX data line missing first variable name! line=%s",
+                       std::string(line).c_str());
+    if (var1_sv[0] == '$') return;
+    const std::string_view var2_sv = get_next_string(line, pos, end);
+    mps_parser_expects(!var2_sv.empty(),
+                       error_type_t::ValidationError,
+                       "QUADOBJ/QMATRIX data line missing second variable name! line=%s",
+                       std::string(line).c_str());
+    if (var2_sv[0] == '$') return;
+    value     = get_numerical_bound<false>(line, end);
+    var1_name = std::string(var1_sv);
+    var2_name = std::string(var2_sv);
   }
 
   // Find variable indices
