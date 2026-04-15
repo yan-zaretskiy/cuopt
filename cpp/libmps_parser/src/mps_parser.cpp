@@ -14,7 +14,6 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
-#include <iostream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -432,6 +431,8 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
       problem.get_constraint_upper_bounds().size());
   }
 
+  const i_t num_vars_for_quad = static_cast<i_t>(var_names.size());
+
   problem.set_problem_name(problem_name);
   problem.set_objective_name(objective_name);
   problem.set_variable_names(std::move(var_names));
@@ -439,13 +440,17 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   problem.set_row_names(std::move(row_names));
   problem.set_maximize(maximize);
 
-  // Helper function to build CSR format using double transpose (O(m+n+nnz) instead of
-  // O(nnz*log(nnz))) For QUADOBJ: handles upper triangular input by expanding to full symmetric
-  // matrix
+  // Helper function to build CSR format using double transpose (O(m+n+nnz) instead of O(nnz*log(nnz))) 
+  // For QUADOBJ: handles upper triangular input by expanding to full symmetric matrix. 
+  // 
+  // @p value_scale: 
+  // QUADOBJ/QMATRIX use 0.5 (MPS ½ xᵀQx vs internal xᵀQx); 
+  // QCMATRIX uses 1.0 (symmetric Q defines xᵀQx directly in the constraint).
   auto build_csr_via_transpose = [](const std::vector<std::tuple<i_t, i_t, f_t>>& entries,
                                     i_t num_rows,
                                     i_t num_cols,
-                                    bool is_quadobj = false) {
+                                    bool symmetrize_upper_triangular,
+                                    f_t value_scale) {
     struct CSRResult {
       std::vector<f_t> values;
       std::vector<i_t> indices;
@@ -467,7 +472,7 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
 
       // For QUADOBJ (upper triangular), add both (row,col) and (col,row) if off-diagonal
       csc_data[col].emplace_back(row, val);
-      if (is_quadobj && row != col) { csc_data[row].emplace_back(col, val); }
+      if (symmetrize_upper_triangular && row != col) { csc_data[row].emplace_back(col, val); }
     }
 
     // Second transpose: convert CSC to CSR (entries sorted by row, columns within rows sorted)
@@ -485,9 +490,7 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
 
     for (i_t row = 0; row < num_rows; ++row) {
       for (const auto& [col, val] : csr_data[row]) {
-        // While the mps format expects to optimize for 0.5 xT Q x, cuopt optimizes for xT Q x
-        // so we have to multiply the value by 0.5 to get the correct value.
-        result.values.push_back(val * 0.5);
+        result.values.push_back(val * value_scale);
         result.indices.push_back(col);
       }
       result.offsets.push_back(result.values.size());
@@ -500,8 +503,9 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   if (!quadobj_entries.empty()) {
     // Convert quadratic objective entries to CSR format using double transpose
     // QUADOBJ stores upper triangular elements, so we expand to full symmetric matrix
-    i_t num_vars    = static_cast<i_t>(var_names.size());
-    auto csr_result = build_csr_via_transpose(quadobj_entries, num_vars, num_vars, true);
+    constexpr f_t k_mps_quad_half_scale = f_t(0.5);  // MPS ½ xᵀQx vs internal xᵀQx
+    auto csr_result =
+      build_csr_via_transpose(quadobj_entries, num_vars_for_quad, num_vars_for_quad, true, k_mps_quad_half_scale);
 
     // Use optimized double transpose method - O(m+n+nnz) instead of O(nnz*log(nnz))
     problem.set_quadratic_objective_matrix(csr_result.values.data(),
@@ -513,8 +517,9 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   } else if (!qmatrix_entries.empty()) {
     // Convert quadratic objective entries to CSR format using double transpose
     // QMATRIX stores full symmetric matrix
-    i_t num_vars    = static_cast<i_t>(var_names.size());
-    auto csr_result = build_csr_via_transpose(qmatrix_entries, num_vars, num_vars, false);
+    constexpr f_t k_mps_quad_half_scale = f_t(0.5);
+    auto csr_result =
+      build_csr_via_transpose(qmatrix_entries, num_vars_for_quad, num_vars_for_quad, false, k_mps_quad_half_scale);
 
     // Use optimized double transpose method - O(m+n+nnz) instead of O(nnz*log(nnz))
     problem.set_quadratic_objective_matrix(csr_result.values.data(),
@@ -523,6 +528,20 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
                                            csr_result.indices.size(),
                                            csr_result.offsets.data(),
                                            csr_result.offsets.size());
+  }
+
+  // QCMATRIX: one symmetric Q per constraint row (no extra ½ factor vs file coeffs)
+  constexpr f_t k_qcmatrix_value_scale = f_t(1);
+  for (const auto& block : qcmatrix_blocks_) {
+    auto csr_result = build_csr_via_transpose(
+      block.entries, num_vars_for_quad, num_vars_for_quad, false, k_qcmatrix_value_scale);
+    problem.append_quadratic_constraint_matrix(block.constraint_row_id,
+                                                csr_result.values.data(),
+                                                csr_result.values.size(),
+                                                csr_result.indices.data(),
+                                                csr_result.indices.size(),
+                                                csr_result.offsets.data(),
+                                                csr_result.offsets.size());
   }
 }
 
@@ -599,6 +618,11 @@ void mps_parser_t<i_t, f_t>::parse_string(char* buf)
     // these lines mark the start of a particular "section"
     if (line[0] != ' ') {
       skip_line = false;
+      // Leaving QCMATRIX: any non-QCMATRIX section header ends the current block
+      if (inside_qcmatrix_ && line.find("QCMATRIX", 0, 8) != 0) {
+        flush_qcmatrix_block();
+        inside_qcmatrix_ = false;
+      }
       if (line.find("NAME", 0, 4) == 0) {
         encountered_sections.insert("NAME");
         auto name_start = line.find_first_not_of(" \t", 4);
@@ -709,6 +733,7 @@ void mps_parser_t<i_t, f_t>::parse_string(char* buf)
         inside_objname_  = false;
         inside_objsense_ = false;
         inside_qmatrix_  = false;
+        inside_qcmatrix_ = false;
         inside_quadobj_  = true;
       } else if (line.find("QMATRIX", 0, 7) == 0) {
         encountered_sections.insert("QMATRIX");
@@ -721,6 +746,21 @@ void mps_parser_t<i_t, f_t>::parse_string(char* buf)
         inside_objsense_ = false;
         inside_quadobj_  = false;
         inside_qmatrix_  = true;
+        inside_qcmatrix_ = false;
+      } else if (line.find("QCMATRIX", 0, 8) == 0) {
+        encountered_sections.insert("QCMATRIX");
+        flush_qcmatrix_block();
+        inside_rows_     = false;
+        inside_columns_  = false;
+        inside_rhs_      = false;
+        inside_bounds_   = false;
+        inside_ranges_   = false;
+        inside_objname_  = false;
+        inside_objsense_ = false;
+        inside_quadobj_  = false;
+        inside_qmatrix_  = false;
+        inside_qcmatrix_ = true;
+        parse_qcmatrix_header(line);
       } else if (line.find("ENDATA", 0, 6) == 0) {
         encountered_sections.insert("ENDATA");
         break;
@@ -737,6 +777,7 @@ void mps_parser_t<i_t, f_t>::parse_string(char* buf)
         inside_objname_  = false;
         inside_quadobj_  = false;
         inside_qmatrix_  = false;
+        inside_qcmatrix_ = false;
       } else {
         mps_parser_expects(false,
                            error_type_t::ValidationError,
@@ -763,6 +804,8 @@ void mps_parser_t<i_t, f_t>::parse_string(char* buf)
       parse_quad(line, true);
     } else if (inside_qmatrix_) {
       parse_quad(line, false);
+    } else if (inside_qcmatrix_) {
+      parse_qcmatrix_data(line);
     } else {
       mps_parser_expects(false,
                          error_type_t::ValidationError,
@@ -1280,6 +1323,109 @@ void mps_parser_t<i_t, f_t>::parse_objname(std::string_view line)
     // Since OBJNAME always is before ROWS, this objective name will keep priority
     objective_name = name;
   }
+}
+
+template <typename i_t, typename f_t>
+void mps_parser_t<i_t, f_t>::flush_qcmatrix_block()
+{
+  if (qcmatrix_active_row_id_ < 0) { return; }
+  if (qcmatrix_current_entries_.empty()) {
+    qcmatrix_active_row_id_ = -1;
+    return;
+  }
+  for (const auto& b : qcmatrix_blocks_) {
+    mps_parser_expects(b.constraint_row_id != qcmatrix_active_row_id_,
+                       error_type_t::ValidationError,
+                       "Duplicate QCMATRIX block for the same constraint row (index %d)",
+                       static_cast<int>(qcmatrix_active_row_id_));
+  }
+  qcmatrix_raw_block_t block;
+  block.constraint_row_id = qcmatrix_active_row_id_;
+  block.entries           = std::move(qcmatrix_current_entries_);
+  qcmatrix_blocks_.push_back(std::move(block));
+  qcmatrix_active_row_id_ = -1;
+}
+
+template <typename i_t, typename f_t>
+void mps_parser_t<i_t, f_t>::parse_qcmatrix_header(std::string_view line)
+{
+  std::string row_name;
+  if (fixed_mps_format) {
+    mps_parser_expects(line.size() >= 19,
+                       error_type_t::ValidationError,
+                       "QCMATRIX header line too short! line=%s",
+                       std::string(line).c_str());
+    //fixed MPS: constraint name starts in column 12 (1-based) → 0-based index 11, 8 chars
+    row_name = std::string(trim(line.substr(11, 8)));
+  } else {
+    std::stringstream ss{std::string(line)};
+    std::string kw;
+    ss >> kw;
+    mps_parser_expects(kw == "QCMATRIX",
+                       error_type_t::ValidationError,
+                       "Expected QCMATRIX keyword! line=%s",
+                       std::string(line).c_str());
+    ss >> row_name;
+    mps_parser_expects(!row_name.empty(),
+                       error_type_t::ValidationError,
+                       "QCMATRIX missing constraint row name! line=%s",
+                       std::string(line).c_str());
+  }
+
+  auto row_it = row_names_map.find(row_name);
+  mps_parser_expects(row_it != row_names_map.end(),
+                     error_type_t::ValidationError,
+                     "Unknown constraint row name '%s' in QCMATRIX! line=%s",
+                     row_name.c_str(),
+                     std::string(line).c_str());
+
+  qcmatrix_active_row_id_ = row_it->second;
+}
+
+template <typename i_t, typename f_t>
+void mps_parser_t<i_t, f_t>::parse_qcmatrix_data(std::string_view line)
+{
+  mps_parser_expects(qcmatrix_active_row_id_ >= 0,
+                     error_type_t::ValidationError,
+                     "QCMATRIX data line before a valid QCMATRIX header! line=%s",
+                     std::string(line).c_str());
+
+  std::string var1_name, var2_name;
+  f_t value;
+
+  if (fixed_mps_format) {
+    mps_parser_expects(line.size() >= 25,
+                       error_type_t::ValidationError,
+                       "QCMATRIX data line should have at least 3 entities! line=%s",
+                       std::string(line).c_str());
+
+    var1_name = std::string(trim(line.substr(4, 8)));
+    var2_name = std::string(trim(line.substr(14, 8)));
+    if (var1_name[0] == '$' || var2_name[0] == '$') return;
+
+    i_t pos = 24;
+    value   = get_numerical_bound<false>(line, pos);
+  } else {
+    std::stringstream ss{std::string(line)};
+    ss >> var1_name >> var2_name >> value;
+    if (var1_name[0] == '$' || var2_name[0] == '$') return;
+  }
+
+  auto var1_it = var_names_map.find(var1_name);
+  auto var2_it = var_names_map.find(var2_name);
+
+  mps_parser_expects(var1_it != var_names_map.end(),
+                     error_type_t::ValidationError,
+                     "Variable '%s' not found in QCMATRIX! line=%s",
+                     var1_name.c_str(),
+                     std::string(line).c_str());
+  mps_parser_expects(var2_it != var_names_map.end(),
+                     error_type_t::ValidationError,
+                     "Variable '%s' not found in QCMATRIX! line=%s",
+                     var2_name.c_str(),
+                     std::string(line).c_str());
+
+  qcmatrix_current_entries_.emplace_back(var1_it->second, var2_it->second, value);
 }
 
 template <typename i_t, typename f_t>

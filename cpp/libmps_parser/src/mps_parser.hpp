@@ -13,6 +13,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -130,6 +131,18 @@ class mps_parser_t {
   // QPS-specific parsing states
   bool inside_quadobj_{false};
   bool inside_qmatrix_{false};
+  bool inside_qcmatrix_{false};
+
+  /** (free-format) QCMATRIX: finalized blocks (row id + triples) */
+  struct qcmatrix_raw_block_t {
+    i_t constraint_row_id{};
+    std::vector<std::tuple<i_t, i_t, f_t>> entries{};
+  };
+  std::vector<qcmatrix_raw_block_t> qcmatrix_blocks_{};
+  /** Triples for the QCMATRIX block currently being read (-1 row id means none) */
+  i_t qcmatrix_active_row_id_{-1};
+  std::vector<std::tuple<i_t, i_t, f_t>> qcmatrix_current_entries_{};
+
   std::unordered_set<std::string> encountered_sections{};
   std::unordered_map<std::string, i_t> row_names_map{};
   std::unordered_map<std::string, i_t> var_names_map{};
@@ -169,6 +182,11 @@ class mps_parser_t {
 
   // QPS-specific parsing methods
   void parse_quad(std::string_view line, bool is_quadobj);
+
+  // QCMATRIX-specific parsing methods
+  void flush_qcmatrix_block();
+  void parse_qcmatrix_header(std::string_view line);
+  void parse_qcmatrix_data(std::string_view line);
 
 };  // class mps_parser_t
 

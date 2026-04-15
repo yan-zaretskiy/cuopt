@@ -262,6 +262,40 @@ class mps_data_model_t {
                                       const i_t* Q_offsets,
                                       i_t size_offsets);
 
+  /**
+   * @brief CSR of Q for one quadratic constraint (MPS QCMATRIX).
+   *
+   * @c constraint_row_index is the row index in the linear constraint matrix A (0-based),
+   * matching the order of non-objective rows in the ROWS section.
+   */
+  struct quadratic_constraint_matrix_t {
+    i_t constraint_row_index{};
+    std::vector<f_t> values;
+    std::vector<i_t> indices;
+    std::vector<i_t> offsets;
+  };
+
+  /**
+   * @brief Append one quadratic constraint matrix (QCMATRIX) in CSR format.
+   *
+   * @param constraint_row_index Row index in A (0-based), matching non-objective ROWS order.
+   * @param[in] Qc_values Values of the CSR representation; copied into the model.
+   * @param size_values Size of the Qc_values array.
+   * @param[in] Qc_indices Indices of the CSR representation; copied into the model.
+   * @param size_indices Size of the Qc_indices array.
+   * @param[in] Qc_offsets Offsets of the CSR representation; copied into the model.
+   * @param size_offsets Size of the Qc_offsets array.
+   */
+  void append_quadratic_constraint_matrix(i_t constraint_row_index,
+                                          const f_t* Qc_values,
+                                          i_t size_values,
+                                          const i_t* Qc_indices,
+                                          i_t size_indices,
+                                          const i_t* Qc_offsets,
+                                          i_t size_offsets);
+
+  const std::vector<quadratic_constraint_matrix_t>& get_quadratic_constraint_matrices() const;
+
   i_t get_n_variables() const;
   i_t get_n_constraints() const;
   i_t get_nnz() const;
@@ -305,6 +339,8 @@ class mps_data_model_t {
   std::vector<i_t>& get_quadratic_objective_offsets();
 
   bool has_quadratic_objective() const noexcept;
+
+  bool has_quadratic_constraints() const noexcept;
 
   /** whether to maximize or minimize the objective function */
   bool maximize_;
@@ -360,6 +396,9 @@ class mps_data_model_t {
   std::vector<f_t> Q_objective_values_;
   std::vector<i_t> Q_objective_indices_;
   std::vector<i_t> Q_objective_offsets_;
+
+  /** One CSR matrix per QCMATRIX block, in order of appearance in the file */
+  std::vector<quadratic_constraint_matrix_t> quadratic_constraint_matrices_;
 
 };  // class mps_data_model_t
 

@@ -9,6 +9,7 @@
 #include <utilities/error.hpp>
 
 #include <algorithm>
+#include <utility>
 
 namespace cuopt::mps_parser {
 
@@ -217,6 +218,51 @@ void mps_data_model_t<i_t, f_t>::set_quadratic_objective_matrix(const f_t* Q_val
     size_offsets > 0, error_type_t::ValidationError, "size_offsets cannot be empty");
   Q_objective_offsets_.resize(size_offsets);
   std::copy(Q_offsets, Q_offsets + size_offsets, Q_objective_offsets_.data());
+}
+
+template <typename i_t, typename f_t>
+void mps_data_model_t<i_t, f_t>::append_quadratic_constraint_matrix(i_t constraint_row_index,
+                                                                    const f_t* Qc_values,
+                                                                    i_t size_values,
+                                                                    const i_t* Qc_indices,
+                                                                    i_t size_indices,
+                                                                    const i_t* Qc_offsets,
+                                                                    i_t size_offsets)
+{
+  if (size_values != 0) {
+    mps_parser_expects(
+      Qc_values != nullptr, error_type_t::ValidationError, "Qc_values cannot be null");
+  }
+  if (size_indices != 0) {
+    mps_parser_expects(
+      Qc_indices != nullptr, error_type_t::ValidationError, "Qc_indices cannot be null");
+  }
+  mps_parser_expects(
+    Qc_offsets != nullptr, error_type_t::ValidationError, "Qc_offsets cannot be null");
+  mps_parser_expects(
+    size_offsets > 0, error_type_t::ValidationError, "size_offsets cannot be empty");
+
+  quadratic_constraint_matrix_t qcm;
+  qcm.constraint_row_index = constraint_row_index;
+  qcm.values.resize(size_values);
+  if (size_values > 0) {
+    std::copy(Qc_values, Qc_values + size_values, qcm.values.data());
+  }
+  qcm.indices.resize(size_indices);
+  if (size_indices > 0) {
+    std::copy(Qc_indices, Qc_indices + size_indices, qcm.indices.data());
+  }
+  qcm.offsets.resize(size_offsets);
+  std::copy(Qc_offsets, Qc_offsets + size_offsets, qcm.offsets.data());
+
+  quadratic_constraint_matrices_.push_back(std::move(qcm));
+}
+
+template <typename i_t, typename f_t>
+auto mps_data_model_t<i_t, f_t>::get_quadratic_constraint_matrices() const
+  -> const std::vector<quadratic_constraint_matrix_t>&
+{
+  return quadratic_constraint_matrices_;
 }
 
 template <typename i_t, typename f_t>
@@ -458,6 +504,12 @@ template <typename i_t, typename f_t>
 bool mps_data_model_t<i_t, f_t>::has_quadratic_objective() const noexcept
 {
   return !Q_objective_values_.empty();
+}
+
+template <typename i_t, typename f_t>
+bool mps_data_model_t<i_t, f_t>::has_quadratic_constraints() const noexcept
+{
+  return !quadratic_constraint_matrices_.empty();
 }
 
 // NOTE: Explicitly instantiate all types here in order to avoid linker error

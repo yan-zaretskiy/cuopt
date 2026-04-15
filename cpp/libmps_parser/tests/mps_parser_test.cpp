@@ -855,6 +855,51 @@ TEST(qps_parser, quadratic_objective_basic)
   EXPECT_EQ(1.0, model.get_quadratic_objective_values()[1]);
 }
 
+// ================================================================================================
+// QCMATRIX Support Tests
+// ================================================================================================
+
+TEST(qps_parser, qcmatrix_append_api)
+{
+  using model_t = mps_data_model_t<int, double>;
+  model_t model;
+
+  // Validate default-constructed struct shape.
+  model_t::quadratic_constraint_matrix_t default_qcm;
+  EXPECT_EQ(0, default_qcm.constraint_row_index);
+  EXPECT_TRUE(default_qcm.values.empty());
+  EXPECT_TRUE(default_qcm.indices.empty());
+  EXPECT_TRUE(default_qcm.offsets.empty());
+
+  // QC0: [[10, 2], [2, 2]]
+  const std::vector<double> qc0_values  = {10.0, 2.0, 2.0, 2.0};
+  const std::vector<int> qc0_indices    = {0, 1, 0, 1};
+  const std::vector<int> qc0_offsets    = {0, 2, 4};
+  model.append_quadratic_constraint_matrix(
+    0, qc0_values.data(), qc0_values.size(), qc0_indices.data(), qc0_indices.size(), qc0_offsets.data(), qc0_offsets.size());
+
+  // QC1: [[4, 1], [1, 6]]
+  const std::vector<double> qc1_values  = {4.0, 1.0, 1.0, 6.0};
+  const std::vector<int> qc1_indices    = {0, 1, 0, 1};
+  const std::vector<int> qc1_offsets    = {0, 2, 4};
+  model.append_quadratic_constraint_matrix(
+    1, qc1_values.data(), qc1_values.size(), qc1_indices.data(), qc1_indices.size(), qc1_offsets.data(), qc1_offsets.size());
+
+  ASSERT_TRUE(model.has_quadratic_constraints());
+  const auto& qcs = model.get_quadratic_constraint_matrices();
+  ASSERT_EQ(2u, qcs.size());
+
+  EXPECT_EQ(0, qcs[0].constraint_row_index);
+  EXPECT_EQ(qc0_values, qcs[0].values);
+  EXPECT_EQ(qc0_indices, qcs[0].indices);
+  EXPECT_EQ(qc0_offsets, qcs[0].offsets);
+
+  EXPECT_EQ(1, qcs[1].constraint_row_index);
+  EXPECT_EQ(qc1_values, qcs[1].values);
+  EXPECT_EQ(qc1_indices, qcs[1].indices);
+  EXPECT_EQ(qc1_offsets, qcs[1].offsets);
+}
+
 // Test actual QPS files from the dataset
 TEST(qps_parser, test_qps_files)
 {
