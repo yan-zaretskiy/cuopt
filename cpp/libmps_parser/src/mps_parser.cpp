@@ -271,6 +271,11 @@ ObjSenseType convert_to_obj_sense(const std::string& str)
 template <typename i_t, typename f_t>
 void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
 {
+  std::unordered_set<i_t> quadratic_row_ids{};
+  for (const auto& block : qcmatrix_blocks_) {
+    quadratic_row_ids.insert(block.constraint_row_id);
+  }
+
   {
     std::vector<i_t> h_offsets{}, h_indices{};
     std::vector<f_t> h_values{};
@@ -278,13 +283,17 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     h_offsets.push_back(0);
     for (i_t i = 0; i < (i_t)A_indices.size(); ++i) {
       i_t off = h_offsets.size() > 0 ? h_offsets[h_offsets.size() - 1] : 0;
-      for (const auto& idx_itr : A_indices[i]) {
-        h_indices.push_back(idx_itr);
+      // Keep quadratic-row linear coefficients out of global A; they are stored with each
+      // quadratic constraint object instead.
+      if (!quadratic_row_ids.count(i)) {
+        for (const auto& idx_itr : A_indices[i]) {
+          h_indices.push_back(idx_itr);
+        }
+        for (const auto& val_itr : A_values[i]) {
+          h_values.push_back(val_itr);
+        }
+        off += A_indices[i].size();
       }
-      for (const auto& val_itr : A_values[i]) {
-        h_values.push_back(val_itr);
-      }
-      off += A_indices[i].size();
       h_offsets.push_back(off);
     }
 
@@ -317,6 +326,7 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
       "nonzero vector. Nonzero has size %zu but the last offset is %d.",
       h_values.size(),
       h_offsets[h_offsets.size() - 1]);
+
   }
 
   // Set b & c
@@ -438,6 +448,13 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   problem.set_variable_names(std::move(var_names));
   problem.set_variable_types(std::move(var_types));
   problem.set_row_names(std::move(row_names));
+  {
+    std::vector<char> row_types_host(row_types.size());
+    for (size_t i = 0; i < row_types.size(); ++i) {
+      row_types_host[i] = static_cast<char>(row_types[i]);
+    }
+    problem.set_row_types(row_types_host.data(), static_cast<i_t>(row_types_host.size()));
+  }
   problem.set_maximize(maximize);
 
   // Helper function to build CSR format using double transpose (O(m+n+nnz) instead of O(nnz*log(nnz))) 
@@ -530,18 +547,36 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
                                            csr_result.offsets.size());
   }
 
-  // QCMATRIX: one symmetric Q per constraint row (no extra ½ factor vs file coeffs)
+  // QCMATRIX: one symmetric Q per constraint row (no extra ½ factor vs file coeffs).
+  // Bundle row metadata, row-linear coefficients (from COLUMNS), rhs, and quadratic part together.
   constexpr f_t k_qcmatrix_value_scale = f_t(1);
   for (const auto& block : qcmatrix_blocks_) {
     auto csr_result = build_csr_via_transpose(
       block.entries, num_vars_for_quad, num_vars_for_quad, false, k_qcmatrix_value_scale);
-    problem.append_quadratic_constraint_matrix(block.constraint_row_id,
-                                                csr_result.values.data(),
-                                                csr_result.values.size(),
-                                                csr_result.indices.data(),
-                                                csr_result.indices.size(),
-                                                csr_result.offsets.data(),
-                                                csr_result.offsets.size());
+    const i_t row_id = block.constraint_row_id;
+    mps_parser_expects(row_id >= 0 && row_id < problem.get_n_constraints(),
+                       error_type_t::ValidationError,
+                       "QCMATRIX row index %d is out of range for constraints",
+                       static_cast<int>(row_id));
+    const i_t linear_nnz  = static_cast<i_t>(A_indices[row_id].size());
+    const f_t* linear_val = linear_nnz > 0 ? A_values[row_id].data() : nullptr;
+    const i_t* linear_idx = linear_nnz > 0 ? A_indices[row_id].data() : nullptr;
+
+    problem.append_quadratic_constraint(
+      row_id,
+      problem.get_row_names()[row_id],
+      problem.get_row_types()[row_id],
+      linear_val,
+      linear_nnz,
+      linear_idx,
+      linear_nnz,
+      problem.get_constraint_bounds()[row_id],
+      csr_result.values.data(),
+      static_cast<i_t>(csr_result.values.size()),
+      csr_result.indices.data(),
+      static_cast<i_t>(csr_result.indices.size()),
+      csr_result.offsets.data(),
+      static_cast<i_t>(csr_result.offsets.size()));
   }
 }
 
