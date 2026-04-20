@@ -316,7 +316,8 @@ void mps_writer_t<i_t, f_t>::write(const std::string& mps_file_path)
           ? qcs_by_decl_row[qc_idx]
           : nullptr;
       if (qc_match != nullptr) {
-        type = qc_match->constraint_row_type;
+        // Quadratic rows are supported only as MPS 'L' (≤); always emit that sense.
+        type = 'L';
       } else {
         int const lj = linear_csr_row_for_mps_decl_index(linear_csr_row_for_mps_decl, k);
         if (lj >= 0) {

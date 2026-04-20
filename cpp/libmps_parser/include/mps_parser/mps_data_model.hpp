@@ -275,6 +275,7 @@ class mps_data_model_t {
     /** ROWS declaration index (among all constraint rows), not an index into the linear CSR. */
     i_t constraint_row_index{};
     std::string constraint_row_name{};
+    /** MPS ROWS sense for this quadratic row; only 'L' (≤) is supported for convex QCQP at the moment. */
     char constraint_row_type{};
     std::vector<f_t> linear_values{};
     std::vector<i_t> linear_indices{};
@@ -284,7 +285,11 @@ class mps_data_model_t {
     std::vector<i_t> quadratic_offsets{};
   };
 
-  /** @brief Append one complete quadratic constraint (row + linear + rhs + quadratic Q). */
+  /**
+   * @brief Append one complete quadratic constraint (row + linear + rhs + quadratic Q).
+   * @param constraint_row_type MPS ROWS type; must be 'L'. 'G' and 'E' quadratic rows are not
+   *        supported.
+   */
   void append_quadratic_constraint(i_t constraint_row_index,
                                    const std::string& constraint_row_name,
                                    char constraint_row_type,
