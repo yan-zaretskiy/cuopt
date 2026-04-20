@@ -355,6 +355,74 @@ bool data_model_view_t<i_t, f_t>::is_Q_symmetrized() const noexcept
   return is_Q_symmetrized_;
 }
 
+template <typename i_t, typename f_t>
+void data_model_view_t<i_t, f_t>::set_quadratic_constraints(
+  std::vector<typename mps_data_model_t<i_t, f_t>::quadratic_constraint_t> constraints)
+{
+  quadratic_constraints_ = std::move(constraints);
+}
+
+template <typename i_t, typename f_t>
+bool data_model_view_t<i_t, f_t>::has_quadratic_constraints() const noexcept
+{
+  return !quadratic_constraints_.empty();
+}
+
+template <typename i_t, typename f_t>
+const std::vector<typename mps_data_model_t<i_t, f_t>::quadratic_constraint_t>&
+data_model_view_t<i_t, f_t>::get_quadratic_constraints() const noexcept
+{
+  return quadratic_constraints_;
+}
+
+template <typename i_t, typename f_t>
+void data_model_view_t<i_t, f_t>::set_linear_constraint_mps_indices(const i_t* indices, i_t size)
+{
+  if (size != 0) {
+    mps_parser_expects(
+      indices != nullptr, error_type_t::ValidationError, "linear MPS indices cannot be null");
+  }
+  linear_mps_indices_owned_.assign(indices, indices + size);
+  if (linear_mps_indices_owned_.empty()) {
+    linear_mps_indices_ = span<i_t const>{};
+  } else {
+    linear_mps_indices_ = span<i_t const>(linear_mps_indices_owned_.data(),
+                                          static_cast<size_t>(linear_mps_indices_owned_.size()));
+  }
+}
+
+template <typename i_t, typename f_t>
+span<i_t const> data_model_view_t<i_t, f_t>::get_linear_constraint_mps_indices() const noexcept
+{
+  return linear_mps_indices_;
+}
+
+template <typename i_t, typename f_t>
+void data_model_view_t<i_t, f_t>::set_mps_declaration_constraint_row_count(i_t count)
+{
+  mps_declaration_constraint_row_count_ = count;
+}
+
+template <typename i_t, typename f_t>
+i_t data_model_view_t<i_t, f_t>::get_mps_declaration_constraint_row_count() const noexcept
+{
+  return mps_declaration_constraint_row_count_;
+}
+
+template <typename i_t, typename f_t>
+void data_model_view_t<i_t, f_t>::set_mps_all_constraint_row_names(std::vector<std::string> names)
+{
+  mps_all_constraint_row_names_ = std::move(names);
+}
+
+template <typename i_t, typename f_t>
+const std::vector<std::string>& data_model_view_t<i_t, f_t>::get_mps_all_constraint_row_names() const
+  noexcept
+{
+  return mps_all_constraint_row_names_;
+}
+
+
 // NOTE: Explicitly instantiate all types here in order to avoid linker error
 template class data_model_view_t<int, float>;
 

@@ -221,6 +221,24 @@ void mps_data_model_t<i_t, f_t>::set_quadratic_objective_matrix(const f_t* Q_val
 }
 
 template <typename i_t, typename f_t>
+void mps_data_model_t<i_t, f_t>::set_linear_constraint_mps_indices(std::vector<i_t> indices)
+{
+  linear_constraint_mps_indices_ = std::move(indices);
+}
+
+template <typename i_t, typename f_t>
+void mps_data_model_t<i_t, f_t>::set_mps_all_constraint_row_names(std::vector<std::string> names)
+{
+  mps_all_constraint_row_names_ = std::move(names);
+}
+
+template <typename i_t, typename f_t>
+void mps_data_model_t<i_t, f_t>::set_mps_declaration_constraint_row_count(i_t count)
+{
+  mps_declaration_constraint_row_count_ = count;
+}
+
+template <typename i_t, typename f_t>
 void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_index,
                                                              const std::string& constraint_row_name,
                                                              char constraint_row_type,
@@ -290,13 +308,6 @@ void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_
     quadratic_offsets, quadratic_offsets + quadratic_size_offsets, qc.quadratic_offsets.data());
 
   quadratic_constraints_.push_back(std::move(qc));
-}
-
-template <typename i_t, typename f_t>
-auto mps_data_model_t<i_t, f_t>::get_quadratic_constraints() const
-  -> const std::vector<quadratic_constraint_t>&
-{
-  return quadratic_constraints_;
 }
 
 template <typename i_t, typename f_t>
@@ -532,6 +543,31 @@ template <typename i_t, typename f_t>
 std::vector<i_t>& mps_data_model_t<i_t, f_t>::get_quadratic_objective_offsets()
 {
   return Q_objective_offsets_;
+}
+
+template <typename i_t, typename f_t>
+const std::vector<i_t>& mps_data_model_t<i_t, f_t>::get_linear_constraint_mps_indices() const
+{
+  return linear_constraint_mps_indices_;
+}
+
+template <typename i_t, typename f_t>
+const std::vector<std::string>& mps_data_model_t<i_t, f_t>::get_mps_all_constraint_row_names() const
+{
+  return mps_all_constraint_row_names_;
+}
+
+template <typename i_t, typename f_t>
+i_t mps_data_model_t<i_t, f_t>::get_mps_declaration_constraint_row_count() const
+{
+  return mps_declaration_constraint_row_count_;
+}
+
+template <typename i_t, typename f_t>
+auto mps_data_model_t<i_t, f_t>::get_quadratic_constraints() const
+  -> const std::vector<quadratic_constraint_t>&
+{
+  return quadratic_constraints_;
 }
 
 template <typename i_t, typename f_t>

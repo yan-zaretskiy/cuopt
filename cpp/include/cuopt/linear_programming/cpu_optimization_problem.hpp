@@ -41,6 +41,8 @@ class mip_solution_interface_t;
 template <typename i_t, typename f_t>
 class cpu_optimization_problem_t : public optimization_problem_interface_t<i_t, f_t> {
  public:
+  using typename optimization_problem_interface_t<i_t, f_t>::mps_quadratic_constraint_t;
+
   cpu_optimization_problem_t();
 
   // Setters
@@ -113,6 +115,17 @@ class cpu_optimization_problem_t : public optimization_problem_interface_t<i_t, 
   const std::vector<f_t>& get_quadratic_objective_values() const override;
   bool has_quadratic_objective() const override;
 
+  void set_quadratic_constraints(std::vector<mps_quadratic_constraint_t> constraints) override;
+  bool has_quadratic_constraints() const override;
+  const std::vector<mps_quadratic_constraint_t>& get_quadratic_constraints() const override;
+  // Additional methods for MPS export if quadratic constraints are present
+  void set_linear_constraint_mps_indices(std::vector<i_t> indices) override;
+  void set_mps_declaration_constraint_row_count(i_t count) override;
+  void set_mps_all_constraint_row_names(std::vector<std::string> names) override;
+  i_t get_mps_declaration_constraint_row_count() const override;
+  const std::vector<i_t>& get_linear_constraint_mps_indices() const override;
+  const std::vector<std::string>& get_mps_all_constraint_row_names() const override;
+
   // Host getters - these are the only supported getters for CPU implementation
   std::vector<f_t> get_constraint_matrix_values_host() const override;
   std::vector<i_t> get_constraint_matrix_indices_host() const override;
@@ -184,6 +197,12 @@ class cpu_optimization_problem_t : public optimization_problem_interface_t<i_t, 
   std::vector<i_t> Q_offsets_;
   std::vector<i_t> Q_indices_;
   std::vector<f_t> Q_values_;
+
+  std::vector<mps_quadratic_constraint_t> quadratic_constraints_{};
+
+  std::vector<i_t> linear_constraint_mps_indices_{};
+  i_t mps_declaration_constraint_row_count_{0};
+  std::vector<std::string> mps_all_constraint_row_names_{};
 
   std::vector<f_t> variable_lower_bounds_;
   std::vector<f_t> variable_upper_bounds_;

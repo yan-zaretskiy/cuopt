@@ -271,6 +271,7 @@ ObjSenseType convert_to_obj_sense(const std::string& str)
 template <typename i_t, typename f_t>
 void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
 {
+  // count the row indices that are quadratic constraints
   std::unordered_set<i_t> quadratic_row_ids{};
   for (const auto& block : qcmatrix_blocks_) {
     quadratic_row_ids.insert(block.constraint_row_id);
@@ -281,20 +282,19 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     std::vector<f_t> h_values{};
 
     h_offsets.push_back(0);
+    i_t num_linear_rows = 0;
     for (i_t i = 0; i < (i_t)A_indices.size(); ++i) {
-      i_t off = h_offsets.size() > 0 ? h_offsets[h_offsets.size() - 1] : 0;
-      // Keep quadratic-row linear coefficients out of global A; they are stored with each
-      // quadratic constraint object instead.
-      if (!quadratic_row_ids.count(i)) {
-        for (const auto& idx_itr : A_indices[i]) {
-          h_indices.push_back(idx_itr);
-        }
-        for (const auto& val_itr : A_values[i]) {
-          h_values.push_back(val_itr);
-        }
-        off += A_indices[i].size();
+      // Quadratic constraint rows are omitted from the linear CSR; linear pieces live in each
+      // quadratic_constraint_t bundle.
+      if (quadratic_row_ids.count(i)) { continue; }
+      ++num_linear_rows;
+      for (const auto& idx_itr : A_indices[i]) {
+        h_indices.push_back(idx_itr);
       }
-      h_offsets.push_back(off);
+      for (const auto& val_itr : A_values[i]) {
+        h_values.push_back(val_itr);
+      }
+      h_offsets.push_back(static_cast<i_t>(h_indices.size()));
     }
 
     problem.set_csr_constraint_matrix(h_values.data(),
@@ -304,12 +304,13 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
                                       h_offsets.data(),
                                       h_offsets.size());
 
-    mps_parser_expects(A_indices.size() + 1 == h_offsets.size(),
-                       error_type_t::ValidationError,
-                       "The row indexing vector for the constraint matrix was not constructed "
-                       "successfully. Should be size %zu, but was size %zu",
-                       A_indices.size() + 1,
-                       h_offsets.size());
+    mps_parser_expects(
+      static_cast<size_t>(num_linear_rows) + 1 == h_offsets.size(),
+      error_type_t::ValidationError,
+      "The row indexing vector for the constraint matrix was not constructed "
+      "successfully. Should be size %zu, but was size %zu",
+      static_cast<size_t>(num_linear_rows) + 1,
+      h_offsets.size());
     mps_parser_expects(
       h_indices.size() == h_values.size(),
       error_type_t::ValidationError,
@@ -329,8 +330,13 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
 
   }
 
-  // Set b & c
-  problem.set_constraint_bounds(b_values.data(), b_values.size());
+  // Set b & c (RHS entries for quadratic rows are stored only on quadratic_constraint_t)
+  std::vector<f_t> b_compacted{};
+  b_compacted.reserve(b_values.size());
+  for (i_t i = 0; i < (i_t)b_values.size(); ++i) {
+    if (!quadratic_row_ids.count(i)) { b_compacted.push_back(b_values[i]); }
+  }
+  problem.set_constraint_bounds(b_compacted.data(), static_cast<i_t>(b_compacted.size()));
   problem.set_objective_coefficients(c_values.data(), c_values.size());
 
   // Set offset and scaling factor of objective function
@@ -352,22 +358,24 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     problem.get_variable_lower_bounds().size(),
     problem.get_variable_upper_bounds().size());
 
-  // Determine the constraint bounds based on row types
+  // Determine the constraint bounds based on row types (quadratic rows use bundles only, not counted here)
   {
     std::vector<f_t> h_constraint_lower_bounds{};
     std::vector<f_t> h_constraint_upper_bounds{};
     for (i_t i = 0; i < (i_t)row_types.size(); ++i) {
+      if (quadratic_row_ids.count(i)) { continue; }
       if (row_types[i] == Equality) {
         h_constraint_lower_bounds.push_back(b_values[i]);
         h_constraint_upper_bounds.push_back(b_values[i]);
+        const size_t r = h_constraint_lower_bounds.size() - 1;
         if (ranges_values.size() > 0 &&
             ranges_values[i] != unset_range_value)  // Add range value if specified
         {
-          mps_parser_expects(!std::isnan(h_constraint_lower_bounds[i]),
+          mps_parser_expects(!std::isnan(h_constraint_lower_bounds[r]),
                              error_type_t::ValidationError,
                              "Constraints lower bound %d shouldn't be nan",
                              i);
-          mps_parser_expects(!std::isnan(h_constraint_upper_bounds[i]),
+          mps_parser_expects(!std::isnan(h_constraint_upper_bounds[r]),
                              error_type_t::ValidationError,
                              "Constraints upper bound %d shouldn't be nan",
                              i);
@@ -376,17 +384,18 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
                              "Equality range value %d shouldn't be nan",
                              i);
           if (ranges_values[i] < f_t(0))
-            h_constraint_lower_bounds[i] = h_constraint_lower_bounds[i] + ranges_values[i];
+            h_constraint_lower_bounds[r] = h_constraint_lower_bounds[r] + ranges_values[i];
           else  // Positive
-            h_constraint_upper_bounds[i] = h_constraint_upper_bounds[i] + ranges_values[i];
+            h_constraint_upper_bounds[r] = h_constraint_upper_bounds[r] + ranges_values[i];
         }
       } else if (row_types[i] == GreaterThanOrEqual) {
         h_constraint_lower_bounds.push_back(b_values[i]);
         h_constraint_upper_bounds.push_back(std::numeric_limits<f_t>::infinity());
+        const size_t r = h_constraint_lower_bounds.size() - 1;
         if (ranges_values.size() > 0 &&
             ranges_values[i] != unset_range_value)  // Add range value if specified
         {
-          mps_parser_expects(!std::isnan(h_constraint_lower_bounds[i]),
+          mps_parser_expects(!std::isnan(h_constraint_lower_bounds[r]),
                              error_type_t::ValidationError,
                              "Constraints lower bound %d shouldn't be nan",
                              i);
@@ -394,15 +403,16 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
                              error_type_t::ValidationError,
                              "Greater range value %d shouldn't be nan",
                              i);
-          h_constraint_upper_bounds[i] = h_constraint_lower_bounds[i] + std::abs(ranges_values[i]);
+          h_constraint_upper_bounds[r] = h_constraint_lower_bounds[r] + std::abs(ranges_values[i]);
         }
       } else if (row_types[i] == LesserThanOrEqual) {
         h_constraint_lower_bounds.push_back(-std::numeric_limits<f_t>::infinity());
         h_constraint_upper_bounds.push_back(b_values[i]);
+        const size_t r = h_constraint_lower_bounds.size() - 1;
         if (ranges_values.size() > 0 &&
             ranges_values[i] != unset_range_value)  // Add range value if specified
         {
-          mps_parser_expects(!std::isnan(h_constraint_upper_bounds[i]),
+          mps_parser_expects(!std::isnan(h_constraint_upper_bounds[r]),
                              error_type_t::ValidationError,
                              "Constraints upper bound %d shouldn't be nan",
                              i);
@@ -410,17 +420,18 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
                              error_type_t::ValidationError,
                              "Lesser range value %d shouldn't be nan",
                              i);
-          h_constraint_lower_bounds[i] = h_constraint_upper_bounds[i] - std::abs(ranges_values[i]);
+          h_constraint_lower_bounds[r] = h_constraint_upper_bounds[r] - std::abs(ranges_values[i]);
         }
       } else {
         mps_parser_expects(false,
                            error_type_t::ValidationError,
                            "Unsupported row type was passed to the Optimization Problem");
       }
+      const size_t r = h_constraint_lower_bounds.size() - 1;
       mps_parser_expects(
-        !std::isnan(h_constraint_lower_bounds[i]), error_type_t::ValidationError, "Cannot be nan");
+        !std::isnan(h_constraint_lower_bounds[r]), error_type_t::ValidationError, "Cannot be nan");
       mps_parser_expects(
-        !std::isnan(h_constraint_upper_bounds[i]), error_type_t::ValidationError, "Cannot be nan");
+        !std::isnan(h_constraint_upper_bounds[r]), error_type_t::ValidationError, "Cannot be nan");
     }
 
     problem.set_constraint_lower_bounds(h_constraint_lower_bounds.data(),
@@ -447,14 +458,6 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   problem.set_objective_name(objective_name);
   problem.set_variable_names(std::move(var_names));
   problem.set_variable_types(std::move(var_types));
-  problem.set_row_names(std::move(row_names));
-  {
-    std::vector<char> row_types_host(row_types.size());
-    for (size_t i = 0; i < row_types.size(); ++i) {
-      row_types_host[i] = static_cast<char>(row_types[i]);
-    }
-    problem.set_row_types(row_types_host.data(), static_cast<i_t>(row_types_host.size()));
-  }
   problem.set_maximize(maximize);
 
   // Helper function to build CSR format using double transpose (O(m+n+nnz) instead of O(nnz*log(nnz))) 
@@ -554,29 +557,66 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     auto csr_result = build_csr_via_transpose(
       block.entries, num_vars_for_quad, num_vars_for_quad, false, k_qcmatrix_value_scale);
     const i_t row_id = block.constraint_row_id;
-    mps_parser_expects(row_id >= 0 && row_id < problem.get_n_constraints(),
-                       error_type_t::ValidationError,
-                       "QCMATRIX row index %d is out of range for constraints",
-                       static_cast<int>(row_id));
+    mps_parser_expects(
+      row_id >= 0 && row_id < static_cast<i_t>(row_types.size()),
+      error_type_t::ValidationError,
+      "QCMATRIX row index %d is out of range for constraints",
+      static_cast<int>(row_id));
     const i_t linear_nnz  = static_cast<i_t>(A_indices[row_id].size());
     const f_t* linear_val = linear_nnz > 0 ? A_values[row_id].data() : nullptr;
     const i_t* linear_idx = linear_nnz > 0 ? A_indices[row_id].data() : nullptr;
 
     problem.append_quadratic_constraint(
       row_id,
-      problem.get_row_names()[row_id],
-      problem.get_row_types()[row_id],
+      row_names[row_id],
+      static_cast<char>(row_types[row_id]),
       linear_val,
       linear_nnz,
       linear_idx,
       linear_nnz,
-      problem.get_constraint_bounds()[row_id],
+      b_values[row_id],
       csr_result.values.data(),
       static_cast<i_t>(csr_result.values.size()),
       csr_result.indices.data(),
       static_cast<i_t>(csr_result.indices.size()),
       csr_result.offsets.data(),
       static_cast<i_t>(csr_result.offsets.size()));
+  }
+
+  std::vector<i_t> linear_mps_indices{};
+  linear_mps_indices.reserve(row_types.size());
+  for (i_t i = 0; i < static_cast<i_t>(row_types.size()); ++i) {
+    if (!quadratic_row_ids.count(i)) { linear_mps_indices.push_back(i); }
+  }
+
+  if (!quadratic_row_ids.empty()) {
+    problem.set_linear_constraint_mps_indices(std::move(linear_mps_indices));
+    problem.set_mps_declaration_constraint_row_count(static_cast<i_t>(row_names.size()));
+    problem.set_mps_all_constraint_row_names(
+      std::vector<std::string>(row_names.begin(), row_names.end()));
+
+    std::vector<std::string> linear_row_names{};
+    std::vector<char> row_types_linear{};
+    linear_row_names.reserve(row_names.size());
+    row_types_linear.reserve(row_names.size());
+    for (size_t i = 0; i < row_names.size(); ++i) {
+      if (!quadratic_row_ids.count(static_cast<i_t>(i))) {
+        linear_row_names.push_back(row_names[i]);
+        row_types_linear.push_back(static_cast<char>(row_types[i]));
+      }
+    }
+    problem.set_row_names(std::move(linear_row_names));
+    problem.set_row_types(row_types_linear.data(), static_cast<i_t>(row_types_linear.size()));
+  } else {
+    problem.set_linear_constraint_mps_indices({});
+    problem.set_mps_declaration_constraint_row_count(0);
+    problem.set_mps_all_constraint_row_names({});
+    std::vector<char> row_types_host(row_types.size());
+    for (size_t i = 0; i < row_types.size(); ++i) {
+      row_types_host[i] = static_cast<char>(row_types[i]);
+    }
+    problem.set_row_names(std::move(row_names));
+    problem.set_row_types(row_types_host.data(), static_cast<i_t>(row_types_host.size()));
   }
 }
 

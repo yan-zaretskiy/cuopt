@@ -956,12 +956,17 @@ TEST(qps_parser, qcmatrix_mps_linear_rhs_and_bounds)
   const auto& qcs = model.get_quadratic_constraints();
   ASSERT_EQ(2u, qcs.size());
 
-  ASSERT_EQ(3, model.get_n_constraints());
-  ASSERT_EQ(3u, model.get_row_names().size());
+  ASSERT_EQ(1, model.get_n_constraints());
+  ASSERT_EQ(1u, model.get_row_names().size());
   EXPECT_EQ("LIN0", model.get_row_names()[0]);
-  EXPECT_EQ("QC0", model.get_row_names()[1]);
-  EXPECT_EQ("QC1", model.get_row_names()[2]);
   EXPECT_EQ('L', model.get_row_types()[0]);
+  ASSERT_EQ(3, model.get_mps_declaration_constraint_row_count());
+  ASSERT_EQ(3u, model.get_mps_all_constraint_row_names().size());
+  EXPECT_EQ("LIN0", model.get_mps_all_constraint_row_names()[0]);
+  EXPECT_EQ("QC0", model.get_mps_all_constraint_row_names()[1]);
+  EXPECT_EQ("QC1", model.get_mps_all_constraint_row_names()[2]);
+  ASSERT_EQ(1u, model.get_linear_constraint_mps_indices().size());
+  EXPECT_EQ(0, model.get_linear_constraint_mps_indices()[0]);
 
   // LIN0: 2*x1 + x2 ≤ 15 (linear row only; not duplicated in quadratic_constraints)
   EXPECT_DOUBLE_EQ(-std::numeric_limits<double>::infinity(),
@@ -976,7 +981,7 @@ TEST(qps_parser, qcmatrix_mps_linear_rhs_and_bounds)
   EXPECT_EQ(0, A_idx[A_off[0] + 0]);
   EXPECT_EQ(1, A_idx[A_off[0] + 1]);
 
-  // QC0: x1 + x2 + xᵀQ₀x ≤ 5 (row index 1: OBJ 'N' rows are not counted in row_names)
+  // QC0: x1 + x2 + xᵀQ₀x ≤ 5 (MPS ROWS declaration index 1; OBJ 'N' rows are not counted)
   EXPECT_EQ(1, qcs[0].constraint_row_index);
   EXPECT_EQ("QC0", qcs[0].constraint_row_name);
   EXPECT_EQ('L', qcs[0].constraint_row_type);
@@ -986,9 +991,6 @@ TEST(qps_parser, qcmatrix_mps_linear_rhs_and_bounds)
   EXPECT_EQ(0, qcs[0].linear_indices[0]);
   EXPECT_EQ(1, qcs[0].linear_indices[1]);
   EXPECT_DOUBLE_EQ(5.0, qcs[0].rhs_value);
-  EXPECT_DOUBLE_EQ(-std::numeric_limits<double>::infinity(),
-                   model.get_constraint_lower_bounds()[qcs[0].constraint_row_index]);
-  EXPECT_DOUBLE_EQ(5.0, model.get_constraint_upper_bounds()[qcs[0].constraint_row_index]);
   EXPECT_FALSE(qcs[0].quadratic_values.empty());
 
   // QC1: 3*x1 + x2 + xᵀQ₁x ≤ 10
@@ -999,9 +1001,6 @@ TEST(qps_parser, qcmatrix_mps_linear_rhs_and_bounds)
   EXPECT_EQ(3.0, qcs[1].linear_values[0]);
   EXPECT_EQ(1.0, qcs[1].linear_values[1]);
   EXPECT_DOUBLE_EQ(10.0, qcs[1].rhs_value);
-  EXPECT_DOUBLE_EQ(-std::numeric_limits<double>::infinity(),
-                   model.get_constraint_lower_bounds()[qcs[1].constraint_row_index]);
-  EXPECT_DOUBLE_EQ(10.0, model.get_constraint_upper_bounds()[qcs[1].constraint_row_index]);
 }
 
 TEST(qps_parser, qcqp_p0033_mps_sections)
@@ -1012,12 +1011,14 @@ TEST(qps_parser, qcqp_p0033_mps_sections)
   const auto model = parse_mps<int, double>(
     cuopt::test::get_rapids_dataset_root_dir() + "/qcqp/p0033_qc1.mps", false);
 
-  EXPECT_EQ(16, model.get_n_constraints());
+  EXPECT_EQ(12, model.get_n_constraints());
   EXPECT_EQ(33, model.get_n_variables());
-  ASSERT_EQ(16u, model.get_row_types().size());
-  ASSERT_EQ(16u, model.get_row_names().size());
+  ASSERT_EQ(12u, model.get_row_types().size());
+  ASSERT_EQ(12u, model.get_row_names().size());
+  ASSERT_EQ(16, model.get_mps_declaration_constraint_row_count());
+  ASSERT_EQ(16u, model.get_mps_all_constraint_row_names().size());
 
-  const auto& rnames = model.get_row_names();
+  const auto& rnames = model.get_mps_all_constraint_row_names();
   auto qc1_it        = std::find(rnames.begin(), rnames.end(), std::string("QC1"));
   ASSERT_NE(qc1_it, rnames.end());
   const int qc1_row = static_cast<int>(qc1_it - rnames.begin());
@@ -1201,6 +1202,46 @@ void compare_data_models(const mps_data_model_t<i_t, f_t>& original,
       EXPECT_EQ(orig_Q_off[i], reload_Q_off[i]) << "Q offset mismatch at index " << i;
     }
   }
+
+  EXPECT_EQ(original.has_quadratic_constraints(), reloaded.has_quadratic_constraints());
+  if (original.has_quadratic_constraints() && reloaded.has_quadratic_constraints()) {
+    const auto& oqc = original.get_quadratic_constraints();
+    const auto& rq  = reloaded.get_quadratic_constraints();
+    ASSERT_EQ(oqc.size(), rq.size()) << "Quadratic constraint count mismatch";
+    for (size_t k = 0; k < oqc.size(); ++k) {
+      EXPECT_EQ(oqc[k].constraint_row_index, rq[k].constraint_row_index);
+      EXPECT_EQ(oqc[k].constraint_row_name, rq[k].constraint_row_name);
+      EXPECT_EQ(oqc[k].constraint_row_type, rq[k].constraint_row_type);
+      EXPECT_NEAR(oqc[k].rhs_value, rq[k].rhs_value, tol);
+      ASSERT_EQ(oqc[k].linear_values.size(), rq[k].linear_values.size());
+      ASSERT_EQ(oqc[k].linear_indices.size(), rq[k].linear_indices.size());
+      for (size_t i = 0; i < oqc[k].linear_values.size(); ++i) {
+        EXPECT_NEAR(oqc[k].linear_values[i], rq[k].linear_values[i], tol);
+        EXPECT_EQ(oqc[k].linear_indices[i], rq[k].linear_indices[i]);
+      }
+      ASSERT_EQ(oqc[k].quadratic_values.size(), rq[k].quadratic_values.size());
+      ASSERT_EQ(oqc[k].quadratic_indices.size(), rq[k].quadratic_indices.size());
+      ASSERT_EQ(oqc[k].quadratic_offsets.size(), rq[k].quadratic_offsets.size());
+      for (size_t i = 0; i < oqc[k].quadratic_values.size(); ++i) {
+        EXPECT_NEAR(oqc[k].quadratic_values[i], rq[k].quadratic_values[i], tol);
+      }
+      for (size_t i = 0; i < oqc[k].quadratic_indices.size(); ++i) {
+        EXPECT_EQ(oqc[k].quadratic_indices[i], rq[k].quadratic_indices[i]);
+      }
+      for (size_t i = 0; i < oqc[k].quadratic_offsets.size(); ++i) {
+        EXPECT_EQ(oqc[k].quadratic_offsets[i], rq[k].quadratic_offsets[i]);
+      }
+    }
+  }
+
+  EXPECT_EQ(original.get_mps_declaration_constraint_row_count(),
+            reloaded.get_mps_declaration_constraint_row_count());
+  EXPECT_EQ(original.get_linear_constraint_mps_indices(), reloaded.get_linear_constraint_mps_indices());
+  ASSERT_EQ(original.get_mps_all_constraint_row_names().size(),
+            reloaded.get_mps_all_constraint_row_names().size());
+  for (size_t i = 0; i < original.get_mps_all_constraint_row_names().size(); ++i) {
+    EXPECT_EQ(original.get_mps_all_constraint_row_names()[i], reloaded.get_mps_all_constraint_row_names()[i]);
+  }
 }
 
 TEST(mps_roundtrip, linear_programming_basic)
@@ -1308,6 +1349,29 @@ TEST(mps_roundtrip, quadratic_programming_qp_test_2)
   compare_data_models(original, reloaded);
 
   // Cleanup
+  std::filesystem::remove(temp_file);
+}
+
+TEST(mps_roundtrip, qcqp_p0033_qc1)
+{
+  if (!file_exists("qcqp/p0033_qc1.mps")) {
+    GTEST_SKIP() << "Test file not found";
+  }
+
+  std::string input_file =
+    cuopt::test::get_rapids_dataset_root_dir() + "/qcqp/p0033_qc1.mps";
+  std::string temp_file = "/tmp/mps_roundtrip_p0033_qc1.mps";
+
+  auto original = parse_mps<int, double>(input_file, false);
+  ASSERT_TRUE(original.has_quadratic_objective());
+  ASSERT_TRUE(original.has_quadratic_constraints());
+
+  mps_writer_t<int, double> writer(original);
+  writer.write(temp_file);
+
+  auto reloaded = parse_mps<int, double>(temp_file, false);
+  compare_data_models(original, reloaded);
+
   std::filesystem::remove(temp_file);
 }
 

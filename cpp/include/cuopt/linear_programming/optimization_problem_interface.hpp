@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cuopt/linear_programming/utilities/internals.hpp>
+#include <mps_parser/mps_data_model.hpp>
 
 #include <raft/core/device_span.hpp>
 #include <raft/core/handle.hpp>
@@ -56,7 +57,54 @@ class optimization_problem_interface_t {
   static_assert(std::is_floating_point<f_t>::value,
                 "'optimization_problem_interface_t' accepts only floating point types for weights");
 
+  /** Quadratic constraints as parsed/stored for MPS QCQP (QCMATRIX rows). */
+  using mps_quadratic_constraint_t =
+    typename mps_parser::mps_data_model_t<i_t, f_t>::quadratic_constraint_t;
+
   virtual ~optimization_problem_interface_t() = default;
+
+  /**
+   * @brief Store quadratic constraints for MPS round-trip (linear + Q parts per QC row).
+   * @note Default implementation ignores; GPU/CPU implementations persist for write_to_mps.
+   */
+  virtual void set_quadratic_constraints(std::vector<mps_quadratic_constraint_t> constraints)
+  {
+    (void)constraints;
+  }
+
+  /** @brief Whether quadratic constraint metadata is present (for MPS export). */
+  virtual bool has_quadratic_constraints() const { return false; }
+
+  /** @brief Quadratic constraints for MPS export (empty if none). */
+  virtual const std::vector<mps_quadratic_constraint_t>& get_quadratic_constraints() const
+  {
+    static const std::vector<mps_quadratic_constraint_t> k_empty{};
+    return k_empty;
+  }
+
+  /**
+   * @brief When QCMATRIX rows are omitted from the linear CSR, maps linear CSR row j to the MPS
+   * ROWS declaration index. Used for MPS export only.
+   */
+  virtual void set_linear_constraint_mps_indices(std::vector<i_t> indices) { (void)indices; }
+
+  virtual void set_mps_declaration_constraint_row_count(i_t count) { (void)count; }
+
+  virtual void set_mps_all_constraint_row_names(std::vector<std::string> names) { (void)names; }
+
+  virtual i_t get_mps_declaration_constraint_row_count() const { return 0; }
+
+  virtual const std::vector<i_t>& get_linear_constraint_mps_indices() const
+  {
+    static const std::vector<i_t> k_empty{};
+    return k_empty;
+  }
+
+  virtual const std::vector<std::string>& get_mps_all_constraint_row_names() const
+  {
+    static const std::vector<std::string> k_empty{};
+    return k_empty;
+  }
 
   // ============================================================================
   // Setters (accept both CPU and GPU pointers)
