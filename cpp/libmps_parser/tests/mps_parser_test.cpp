@@ -961,13 +961,6 @@ TEST(qps_parser, qcmatrix_mps_linear_rhs_and_bounds)
   ASSERT_EQ(1u, model.get_row_names().size());
   EXPECT_EQ("LIN0", model.get_row_names()[0]);
   EXPECT_EQ('L', model.get_row_types()[0]);
-  ASSERT_EQ(3, model.get_mps_declaration_constraint_row_count());
-  ASSERT_EQ(3u, model.get_mps_all_constraint_row_names().size());
-  EXPECT_EQ("LIN0", model.get_mps_all_constraint_row_names()[0]);
-  EXPECT_EQ("QC0", model.get_mps_all_constraint_row_names()[1]);
-  EXPECT_EQ("QC1", model.get_mps_all_constraint_row_names()[2]);
-  ASSERT_EQ(1u, model.get_linear_constraint_mps_indices().size());
-  EXPECT_EQ(0, model.get_linear_constraint_mps_indices()[0]);
 
   // LIN0: 2*x1 + x2 ≤ 15 (linear row only; not duplicated in quadratic_constraints)
   EXPECT_DOUBLE_EQ(-std::numeric_limits<double>::infinity(),
@@ -1016,19 +1009,10 @@ TEST(qps_parser, qcqp_p0033_mps_sections)
   EXPECT_EQ(33, model.get_n_variables());
   ASSERT_EQ(12u, model.get_row_types().size());
   ASSERT_EQ(12u, model.get_row_names().size());
-  ASSERT_EQ(16, model.get_mps_declaration_constraint_row_count());
-  ASSERT_EQ(16u, model.get_mps_all_constraint_row_names().size());
 
-  const auto& rnames = model.get_mps_all_constraint_row_names();
-  auto qc1_it        = std::find(rnames.begin(), rnames.end(), std::string("QC1"));
-  ASSERT_NE(qc1_it, rnames.end());
-  const int qc1_row = static_cast<int>(qc1_it - rnames.begin());
-
-  std::vector<double> coeff;
-  std::vector<int> vars;
   const auto& qcs = model.get_quadratic_constraints();
   ASSERT_EQ(4u, qcs.size());
-  EXPECT_EQ(qc1_row, qcs[0].constraint_row_index);
+  EXPECT_EQ(12, qcs[0].constraint_row_index);
   ASSERT_EQ(1u, qcs[0].linear_values.size());
   EXPECT_DOUBLE_EQ(1.0, qcs[0].linear_values[0]);
 
@@ -1235,14 +1219,6 @@ void compare_data_models(const mps_data_model_t<i_t, f_t>& original,
     }
   }
 
-  EXPECT_EQ(original.get_mps_declaration_constraint_row_count(),
-            reloaded.get_mps_declaration_constraint_row_count());
-  EXPECT_EQ(original.get_linear_constraint_mps_indices(), reloaded.get_linear_constraint_mps_indices());
-  ASSERT_EQ(original.get_mps_all_constraint_row_names().size(),
-            reloaded.get_mps_all_constraint_row_names().size());
-  for (size_t i = 0; i < original.get_mps_all_constraint_row_names().size(); ++i) {
-    EXPECT_EQ(original.get_mps_all_constraint_row_names()[i], reloaded.get_mps_all_constraint_row_names()[i]);
-  }
 }
 
 TEST(mps_roundtrip, linear_programming_basic)

@@ -553,6 +553,8 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   // QCMATRIX: one symmetric Q per constraint row (no extra ½ factor vs file coeffs).
   // Bundle row metadata, row-linear coefficients (from COLUMNS), rhs, and quadratic part together.
   constexpr f_t k_qcmatrix_value_scale = f_t(1);
+  const i_t linear_row_count           = static_cast<i_t>(row_types.size() - quadratic_row_ids.size());
+  i_t quadratic_row_id              = 0;
   for (const auto& block : qcmatrix_blocks_) {
     auto csr_result = build_csr_via_transpose(
       block.entries, num_vars_for_quad, num_vars_for_quad, false, k_qcmatrix_value_scale);
@@ -567,7 +569,7 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     const i_t* linear_idx = linear_nnz > 0 ? A_indices[row_id].data() : nullptr;
 
     problem.append_quadratic_constraint(
-      row_id,
+      linear_row_count + quadratic_row_id,
       row_names[row_id],
       static_cast<char>(row_types[row_id]),
       linear_val,
@@ -581,20 +583,10 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
       static_cast<i_t>(csr_result.indices.size()),
       csr_result.offsets.data(),
       static_cast<i_t>(csr_result.offsets.size()));
-  }
-
-  std::vector<i_t> linear_mps_indices{};
-  linear_mps_indices.reserve(row_types.size());
-  for (i_t i = 0; i < static_cast<i_t>(row_types.size()); ++i) {
-    if (!quadratic_row_ids.count(i)) { linear_mps_indices.push_back(i); }
+    ++quadratic_row_id;
   }
 
   if (!quadratic_row_ids.empty()) {
-    problem.set_linear_constraint_mps_indices(std::move(linear_mps_indices));
-    problem.set_mps_declaration_constraint_row_count(static_cast<i_t>(row_names.size()));
-    problem.set_mps_all_constraint_row_names(
-      std::vector<std::string>(row_names.begin(), row_names.end()));
-
     std::vector<std::string> linear_row_names{};
     std::vector<char> row_types_linear{};
     linear_row_names.reserve(row_names.size());
@@ -608,9 +600,6 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     problem.set_row_names(std::move(linear_row_names));
     problem.set_row_types(row_types_linear.data(), static_cast<i_t>(row_types_linear.size()));
   } else {
-    problem.set_linear_constraint_mps_indices({});
-    problem.set_mps_declaration_constraint_row_count(0);
-    problem.set_mps_all_constraint_row_names({});
     std::vector<char> row_types_host(row_types.size());
     for (size_t i = 0; i < row_types.size(); ++i) {
       row_types_host[i] = static_cast<char>(row_types[i]);

@@ -353,25 +353,6 @@ class mps_data_model_t {
 
   bool has_quadratic_constraints() const noexcept;
 
-  /**
-   * @brief When quadratic constraints are present, CSR rows are linear-only; entry j is the MPS
-   * ROWS declaration index for linear CSR row j.
-   */
-  void set_linear_constraint_mps_indices(std::vector<i_t> indices);
-
-  /**
-   * @brief ROWS names in declaration order (size == declaration row count). Used for MPS export
-   * when linear CSR excludes quadratic rows.
-   */
-  void set_mps_all_constraint_row_names(std::vector<std::string> names);
-
-  /** @brief Total ROWS constraint count (linear + quadratic) when QC rows are separated; else 0. */
-  void set_mps_declaration_constraint_row_count(i_t count);
-
-  const std::vector<i_t>& get_linear_constraint_mps_indices() const;
-  const std::vector<std::string>& get_mps_all_constraint_row_names() const;
-  i_t get_mps_declaration_constraint_row_count() const;
-
   /** whether to maximize or minimize the objective function */
   bool maximize_;
   /**
@@ -408,10 +389,7 @@ class mps_data_model_t {
   std::string problem_name_;
   /** names of each of the variables in the OP */
   std::vector<std::string> var_names_{};
-  /**
-   * names of linear constraint rows only when QCMATRIX rows are separated; otherwise all constraint
-   * rows (same as MPS ROWS order excluding objective).
-   */
+  /** names of linear constraint rows in exported MPS order. */
   std::vector<std::string> row_names_{};
   /** number of variables */
   i_t n_vars_{0};
@@ -432,11 +410,6 @@ class mps_data_model_t {
 
   /** One full quadratic constraint per QCMATRIX block, in order of appearance in the file */
   std::vector<quadratic_constraint_t> quadratic_constraints_;
-
-  /** Maps linear CSR row j -> MPS ROWS declaration index; non-empty iff QC rows are split out. */
-  std::vector<i_t> linear_constraint_mps_indices_{};
-  i_t mps_declaration_constraint_row_count_{0};
-  std::vector<std::string> mps_all_constraint_row_names_{};
 
 };  // class mps_data_model_t
 

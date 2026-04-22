@@ -421,21 +421,29 @@ class data_model_view_t {
    */
   void set_quadratic_constraints(
     std::vector<typename mps_data_model_t<i_t, f_t>::quadratic_constraint_t> constraints);
+  template <typename qc_t>
+  void set_quadratic_constraints(const std::vector<qc_t>& constraints)
+  {
+    quadratic_constraints_.clear();
+    quadratic_constraints_.reserve(constraints.size());
+    for (const auto& qc : constraints) {
+      quadratic_constraints_.push_back(
+        {static_cast<i_t>(qc.constraint_row_index),
+         qc.constraint_row_name,
+         qc.constraint_row_type,
+         std::vector<f_t>(qc.linear_values.begin(), qc.linear_values.end()),
+         std::vector<i_t>(qc.linear_indices.begin(), qc.linear_indices.end()),
+         static_cast<f_t>(qc.rhs_value),
+         std::vector<f_t>(qc.quadratic_values.begin(), qc.quadratic_values.end()),
+         std::vector<i_t>(qc.quadratic_indices.begin(), qc.quadratic_indices.end()),
+         std::vector<i_t>(qc.quadratic_offsets.begin(), qc.quadratic_offsets.end())});
+    }
+  }
 
   bool has_quadratic_constraints() const noexcept;
 
   const std::vector<typename mps_data_model_t<i_t, f_t>::quadratic_constraint_t>&
   get_quadratic_constraints() const noexcept;
-
-  void set_linear_constraint_mps_indices(const i_t* indices, i_t size);
-  span<i_t const> get_linear_constraint_mps_indices() const noexcept;
-
-  void set_mps_declaration_constraint_row_count(i_t count);
-  i_t get_mps_declaration_constraint_row_count() const noexcept;
-
-  void set_mps_all_constraint_row_names(std::vector<std::string> names);
-
-  const std::vector<std::string>& get_mps_all_constraint_row_names() const noexcept;
 
  private:
   bool maximize_{false};
@@ -468,11 +476,6 @@ class data_model_view_t {
   bool is_Q_symmetrized_{false};
 
   std::vector<typename mps_data_model_t<i_t, f_t>::quadratic_constraint_t> quadratic_constraints_;
-
-  span<i_t const> linear_mps_indices_{};
-  std::vector<i_t> linear_mps_indices_owned_{};
-  i_t mps_declaration_constraint_row_count_{0};
-  std::vector<std::string> mps_all_constraint_row_names_{};
 };  // class data_model_view_t
 
 }  // namespace cuopt::mps_parser

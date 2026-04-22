@@ -98,10 +98,7 @@ optimization_problem_t<i_t, f_t>::optimization_problem_t(
     problem_category_{other.get_problem_category()},
     var_names_{other.get_variable_names()},
     row_names_{other.get_row_names()},
-    quadratic_constraints_{other.get_quadratic_constraints()},
-    linear_constraint_mps_indices_{other.get_linear_constraint_mps_indices()},
-    mps_declaration_constraint_row_count_{other.get_mps_declaration_constraint_row_count()},
-    mps_all_constraint_row_names_{other.get_mps_all_constraint_row_names()}
+    quadratic_constraints_{other.get_quadratic_constraints()}
 {
 }
 
@@ -203,47 +200,10 @@ void optimization_problem_t<i_t, f_t>::set_quadratic_objective_matrix(
 
 template <typename i_t, typename f_t>
 void optimization_problem_t<i_t, f_t>::set_quadratic_constraints(
-  std::vector<typename optimization_problem_interface_t<i_t, f_t>::mps_quadratic_constraint_t>
+  std::vector<typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t>
     constraints)
 {
   quadratic_constraints_ = std::move(constraints);
-}
-
-template <typename i_t, typename f_t>
-void optimization_problem_t<i_t, f_t>::set_linear_constraint_mps_indices(std::vector<i_t> indices)
-{
-  linear_constraint_mps_indices_ = std::move(indices);
-}
-
-template <typename i_t, typename f_t>
-void optimization_problem_t<i_t, f_t>::set_mps_declaration_constraint_row_count(i_t count)
-{
-  mps_declaration_constraint_row_count_ = count;
-}
-
-template <typename i_t, typename f_t>
-void optimization_problem_t<i_t, f_t>::set_mps_all_constraint_row_names(std::vector<std::string> names)
-{
-  mps_all_constraint_row_names_ = std::move(names);
-}
-
-template <typename i_t, typename f_t>
-i_t optimization_problem_t<i_t, f_t>::get_mps_declaration_constraint_row_count() const
-{
-  return mps_declaration_constraint_row_count_;
-}
-
-template <typename i_t, typename f_t>
-const std::vector<i_t>& optimization_problem_t<i_t, f_t>::get_linear_constraint_mps_indices() const
-{
-  return linear_constraint_mps_indices_;
-}
-
-template <typename i_t, typename f_t>
-const std::vector<std::string>& optimization_problem_t<i_t, f_t>::get_mps_all_constraint_row_names()
-  const
-{
-  return mps_all_constraint_row_names_;
 }
 
 template <typename i_t, typename f_t>
@@ -598,7 +558,7 @@ bool optimization_problem_t<i_t, f_t>::has_quadratic_objective() const
 }
 
 template <typename i_t, typename f_t>
-const std::vector<typename optimization_problem_interface_t<i_t, f_t>::mps_quadratic_constraint_t>&
+const std::vector<typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t>&
 optimization_problem_t<i_t, f_t>::get_quadratic_constraints() const
 {
   return quadratic_constraints_;
@@ -882,23 +842,8 @@ void optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_file_
                                                    is_symmetrized);
   }
 
-  if (has_quadratic_constraints()) {
-    data_model_view.set_quadratic_constraints(
-      std::vector<typename optimization_problem_interface_t<i_t, f_t>::mps_quadratic_constraint_t>(
-        get_quadratic_constraints()));
-  }
-
-  if (get_mps_declaration_constraint_row_count() > 0) {
-    data_model_view.set_mps_declaration_constraint_row_count(get_mps_declaration_constraint_row_count());
-    if (!get_linear_constraint_mps_indices().empty()) {
-      data_model_view.set_linear_constraint_mps_indices(get_linear_constraint_mps_indices().data(),
-                                                        static_cast<i_t>(
-                                                          get_linear_constraint_mps_indices().size()));
-    }
-    if (!get_mps_all_constraint_row_names().empty()) {
-      data_model_view.set_mps_all_constraint_row_names(
-        std::vector<std::string>(get_mps_all_constraint_row_names()));
-    }
+  if (!quadratic_constraints_.empty()) {
+    data_model_view.set_quadratic_constraints(quadratic_constraints_);
   }
 
   cuopt::mps_parser::write_mps(data_model_view, mps_file_path);
@@ -1111,11 +1056,6 @@ bool optimization_problem_t<i_t, f_t>::is_equivalent(
   if (maximize_ != other.maximize_) { return false; }
   if (n_vars_ != other.n_vars_) { return false; }
   if (n_constraints_ != other.n_constraints_) { return false; }
-  if (linear_constraint_mps_indices_ != other.linear_constraint_mps_indices_) { return false; }
-  if (mps_declaration_constraint_row_count_ != other.mps_declaration_constraint_row_count_) {
-    return false;
-  }
-  if (mps_all_constraint_row_names_ != other.mps_all_constraint_row_names_) { return false; }
   if (objective_scaling_factor_ != other.objective_scaling_factor_) { return false; }
   if (objective_offset_ != other.objective_offset_) { return false; }
   if (problem_category_ != other.problem_category_) { return false; }
@@ -1260,10 +1200,6 @@ bool optimization_problem_t<i_t, f_t>::is_equivalent(
   if (maximize_ != other.get_sense()) return false;
   if (n_vars_ != other.get_n_variables()) return false;
   if (n_constraints_ != other.get_n_constraints()) return false;
-  if (get_mps_declaration_constraint_row_count() != other.get_mps_declaration_constraint_row_count())
-    return false;
-  if (get_linear_constraint_mps_indices() != other.get_linear_constraint_mps_indices()) return false;
-  if (get_mps_all_constraint_row_names() != other.get_mps_all_constraint_row_names()) return false;
   if (std::abs(objective_scaling_factor_ - other.get_objective_scaling_factor()) > 1e-9)
     return false;
   if (std::abs(objective_offset_ - other.get_objective_offset()) > 1e-9) return false;

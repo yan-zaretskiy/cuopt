@@ -73,7 +73,7 @@ class optimization_problem_t : public optimization_problem_interface_t<i_t, f_t>
                 "'optimization_problem_t' accepts only floating point types for weights");
 
   // nvcc does not always find base typedefs in derived class scope; inject explicitly.
-  using typename optimization_problem_interface_t<i_t, f_t>::mps_quadratic_constraint_t;
+  using typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t;
 
   /**
    * @brief A device-side view of the `optimization_problem_t` structure with
@@ -199,7 +199,7 @@ class optimization_problem_t : public optimization_problem_interface_t<i_t, f_t>
                                       i_t size_offsets,
                                       bool validate_positive_semi_definite = false) override;
 
-  void set_quadratic_constraints(std::vector<mps_quadratic_constraint_t> constraints) override;
+  void set_quadratic_constraints(std::vector<quadratic_constraint_t> constraints) override;
 
   /** @copydoc optimization_problem_interface_t::set_variable_lower_bounds */
   void set_variable_lower_bounds(const f_t* variable_lower_bounds, i_t size) override;
@@ -264,16 +264,9 @@ class optimization_problem_t : public optimization_problem_interface_t<i_t, f_t>
   const std::vector<i_t>& get_quadratic_objective_offsets() const override;
   const std::vector<i_t>& get_quadratic_objective_indices() const override;
   const std::vector<f_t>& get_quadratic_objective_values() const override;
-  const std::vector<mps_quadratic_constraint_t>& get_quadratic_constraints() const override;
+  const std::vector<quadratic_constraint_t>& get_quadratic_constraints() const override;
   bool has_quadratic_objective() const override;
   bool has_quadratic_constraints() const override;
-
-  void set_linear_constraint_mps_indices(std::vector<i_t> indices) override;
-  void set_mps_declaration_constraint_row_count(i_t count) override;
-  void set_mps_all_constraint_row_names(std::vector<std::string> names) override;
-  i_t get_mps_declaration_constraint_row_count() const override;
-  const std::vector<i_t>& get_linear_constraint_mps_indices() const override;
-  const std::vector<std::string>& get_mps_all_constraint_row_names() const override;
 
   // ============================================================================
   // Host getters
@@ -391,11 +384,7 @@ class optimization_problem_t : public optimization_problem_interface_t<i_t, f_t>
   std::vector<f_t> Q_values_;
 
   /** QCQP: quadratic constraints **/
-  std::vector<mps_quadratic_constraint_t> quadratic_constraints_{};
-
-  std::vector<i_t> linear_constraint_mps_indices_{};
-  i_t mps_declaration_constraint_row_count_{0};
-  std::vector<std::string> mps_all_constraint_row_names_{};
+  std::vector<quadratic_constraint_t> quadratic_constraints_{};
 
   rmm::device_uvector<f_t> variable_lower_bounds_;
   rmm::device_uvector<f_t> variable_upper_bounds_;

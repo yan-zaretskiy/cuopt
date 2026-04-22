@@ -8,7 +8,6 @@
 #pragma once
 
 #include <cuopt/linear_programming/utilities/internals.hpp>
-#include <mps_parser/mps_data_model.hpp>
 
 #include <raft/core/device_span.hpp>
 #include <raft/core/handle.hpp>
@@ -57,9 +56,18 @@ class optimization_problem_interface_t {
   static_assert(std::is_floating_point<f_t>::value,
                 "'optimization_problem_interface_t' accepts only floating point types for weights");
 
-  /** Quadratic constraints as parsed/stored for MPS QCQP (QCMATRIX rows). */
-  using mps_quadratic_constraint_t =
-    typename mps_parser::mps_data_model_t<i_t, f_t>::quadratic_constraint_t;
+  /** Quadratic constraint bundle used by core optimization problem interfaces. */
+  struct quadratic_constraint_t {
+    i_t constraint_row_index{};
+    std::string constraint_row_name{};
+    char constraint_row_type{};
+    std::vector<f_t> linear_values{};
+    std::vector<i_t> linear_indices{};
+    f_t rhs_value{f_t(0)};
+    std::vector<f_t> quadratic_values{};
+    std::vector<i_t> quadratic_indices{};
+    std::vector<i_t> quadratic_offsets{};
+  };
 
   virtual ~optimization_problem_interface_t() = default;
 
@@ -67,42 +75,37 @@ class optimization_problem_interface_t {
    * @brief Store quadratic constraints for MPS round-trip (linear + Q parts per QC row).
    * @note Default implementation ignores; GPU/CPU implementations persist for write_to_mps.
    */
-  virtual void set_quadratic_constraints(std::vector<mps_quadratic_constraint_t> constraints)
+  virtual void set_quadratic_constraints(std::vector<quadratic_constraint_t> constraints)
   {
     (void)constraints;
   }
+  template <typename qc_t, typename = std::enable_if_t<!std::is_same_v<qc_t, quadratic_constraint_t>>>
+  void set_quadratic_constraints(const std::vector<qc_t>& constraints)
+  {
+    std::vector<quadratic_constraint_t> converted_constraints;
+    converted_constraints.reserve(constraints.size());
+    for (const auto& qc : constraints) {
+      converted_constraints.push_back(
+        {static_cast<i_t>(qc.constraint_row_index),
+         qc.constraint_row_name,
+         qc.constraint_row_type,
+         std::vector<f_t>(qc.linear_values.begin(), qc.linear_values.end()),
+         std::vector<i_t>(qc.linear_indices.begin(), qc.linear_indices.end()),
+         static_cast<f_t>(qc.rhs_value),
+         std::vector<f_t>(qc.quadratic_values.begin(), qc.quadratic_values.end()),
+         std::vector<i_t>(qc.quadratic_indices.begin(), qc.quadratic_indices.end()),
+         std::vector<i_t>(qc.quadratic_offsets.begin(), qc.quadratic_offsets.end())});
+    }
+    set_quadratic_constraints(std::move(converted_constraints));
+  }
 
   /** @brief Whether quadratic constraint metadata is present (for MPS export). */
-  virtual bool has_quadratic_constraints() const { return false; }
+  virtual bool has_quadratic_constraints() const = 0;
 
   /** @brief Quadratic constraints for MPS export (empty if none). */
-  virtual const std::vector<mps_quadratic_constraint_t>& get_quadratic_constraints() const
+  virtual const std::vector<quadratic_constraint_t>& get_quadratic_constraints() const
   {
-    static const std::vector<mps_quadratic_constraint_t> k_empty{};
-    return k_empty;
-  }
-
-  /**
-   * @brief When QCMATRIX rows are omitted from the linear CSR, maps linear CSR row j to the MPS
-   * ROWS declaration index. Used for MPS export only.
-   */
-  virtual void set_linear_constraint_mps_indices(std::vector<i_t> indices) { (void)indices; }
-
-  virtual void set_mps_declaration_constraint_row_count(i_t count) { (void)count; }
-
-  virtual void set_mps_all_constraint_row_names(std::vector<std::string> names) { (void)names; }
-
-  virtual i_t get_mps_declaration_constraint_row_count() const { return 0; }
-
-  virtual const std::vector<i_t>& get_linear_constraint_mps_indices() const
-  {
-    static const std::vector<i_t> k_empty{};
-    return k_empty;
-  }
-
-  virtual const std::vector<std::string>& get_mps_all_constraint_row_names() const
-  {
-    static const std::vector<std::string> k_empty{};
+    static const std::vector<quadratic_constraint_t> k_empty{};
     return k_empty;
   }
 

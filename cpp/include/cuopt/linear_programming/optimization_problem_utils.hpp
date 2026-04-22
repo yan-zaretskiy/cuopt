@@ -111,22 +111,9 @@ void populate_from_mps_data_model(optimization_problem_interface_t<i_t, f_t>* pr
   }
   // Handle quadratic constraints if present
   if (data_model.has_quadratic_constraints()) {
-    problem->set_quadratic_constraints(
-      std::vector<typename mps_parser::mps_data_model_t<i_t, f_t>::quadratic_constraint_t>(
-        data_model.get_quadratic_constraints()));
+    problem->set_quadratic_constraints(data_model.get_quadratic_constraints());
   }
 
-  if (data_model.get_mps_declaration_constraint_row_count() > 0) {
-    problem->set_linear_constraint_mps_indices(
-      std::vector<i_t>(data_model.get_linear_constraint_mps_indices()));
-    problem->set_mps_declaration_constraint_row_count(data_model.get_mps_declaration_constraint_row_count());
-    problem->set_mps_all_constraint_row_names(
-      std::vector<std::string>(data_model.get_mps_all_constraint_row_names()));
-  } else {
-    problem->set_linear_constraint_mps_indices({});
-    problem->set_mps_declaration_constraint_row_count(0);
-    problem->set_mps_all_constraint_row_names({});
-  }
 }
 
 /**
@@ -285,20 +272,10 @@ void populate_from_data_model_view(optimization_problem_interface_t<i_t, f_t>* p
     problem->set_row_names(data_model->get_row_names());
   }
 
-  if (data_model->get_mps_declaration_constraint_row_count() > 0) {
-    const auto lmi = data_model->get_linear_constraint_mps_indices();
-    if (lmi.size() > 0) {
-      problem->set_linear_constraint_mps_indices(std::vector<i_t>(
-        lmi.data(), lmi.data() + static_cast<size_t>(lmi.size())));
-    }
-    problem->set_mps_declaration_constraint_row_count(data_model->get_mps_declaration_constraint_row_count());
-    problem->set_mps_all_constraint_row_names(
-      std::vector<std::string>(data_model->get_mps_all_constraint_row_names()));
-  } else {
-    problem->set_linear_constraint_mps_indices({});
-    problem->set_mps_declaration_constraint_row_count(0);
-    problem->set_mps_all_constraint_row_names({});
+  if (data_model->has_quadratic_constraints()) {
+    problem->set_quadratic_constraints(data_model->get_quadratic_constraints());
   }
+
 }
 
 }  // namespace cuopt::linear_programming
