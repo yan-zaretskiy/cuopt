@@ -569,25 +569,16 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
       error_type_t::ValidationError,
       "QCMATRIX row index %d is out of range for constraints",
       static_cast<int>(row_id));
-    const i_t linear_nnz  = static_cast<i_t>(A_indices[row_id].size());
-    const f_t* linear_val = linear_nnz > 0 ? A_values[row_id].data() : nullptr;
-    const i_t* linear_idx = linear_nnz > 0 ? A_indices[row_id].data() : nullptr;
-
     problem.append_quadratic_constraint(
       linear_row_count + quadratic_row_id,
       row_names[row_id],
       static_cast<char>(row_types[row_id]),
-      linear_val,
-      linear_nnz,
-      linear_idx,
-      linear_nnz,
+      A_values[row_id],
+      A_indices[row_id],
       b_values[row_id],
-      csr_result.values.data(),
-      static_cast<i_t>(csr_result.values.size()),
-      csr_result.indices.data(),
-      static_cast<i_t>(csr_result.indices.size()),
-      csr_result.offsets.data(),
-      static_cast<i_t>(csr_result.offsets.size()));
+      csr_result.values,
+      csr_result.indices,
+      csr_result.offsets);
     ++quadratic_row_id;
   }
 

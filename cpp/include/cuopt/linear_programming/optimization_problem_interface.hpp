@@ -73,12 +73,8 @@ class optimization_problem_interface_t {
 
   /**
    * @brief Store quadratic constraints for MPS round-trip (linear + Q parts per QC row).
-   * @note Default implementation ignores; GPU/CPU implementations persist for write_to_mps.
    */
-  virtual void set_quadratic_constraints(std::vector<quadratic_constraint_t> constraints)
-  {
-    (void)constraints;
-  }
+  virtual void set_quadratic_constraints(std::vector<quadratic_constraint_t> constraints) = 0;
   template <typename qc_t, typename = std::enable_if_t<!std::is_same_v<qc_t, quadratic_constraint_t>>>
   void set_quadratic_constraints(const std::vector<qc_t>& constraints)
   {
@@ -103,11 +99,7 @@ class optimization_problem_interface_t {
   virtual bool has_quadratic_constraints() const = 0;
 
   /** @brief Quadratic constraints for MPS export (empty if none). */
-  virtual const std::vector<quadratic_constraint_t>& get_quadratic_constraints() const
-  {
-    static const std::vector<quadratic_constraint_t> k_empty{};
-    return k_empty;
-  }
+  virtual const std::vector<quadratic_constraint_t>& get_quadratic_constraints() const = 0;
 
   // ============================================================================
   // Setters (accept both CPU and GPU pointers)
