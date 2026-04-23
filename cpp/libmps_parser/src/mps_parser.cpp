@@ -18,6 +18,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 #ifdef MPS_PARSER_WITH_BZIP2
 #include <bzlib.h>
@@ -271,11 +272,13 @@ ObjSenseType convert_to_obj_sense(const std::string& str)
 template <typename i_t, typename f_t>
 void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
 {
-  // count the row indices that are quadratic constraints
+  // Row indices that have QCMATRIX blocks (quadratic rows follow linear rows in ROWS under
+  // our MPS section rules; names are not required to be QC0..QCN)
   std::unordered_set<i_t> quadratic_row_ids{};
   for (const auto& block : qcmatrix_blocks_) {
     quadratic_row_ids.insert(block.constraint_row_id);
   }
+  const auto is_quadratic_row = [&quadratic_row_ids](i_t row) { return quadratic_row_ids.count(row); };
 
   {
     std::vector<i_t> h_offsets{}, h_indices{};
@@ -286,7 +289,7 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     for (i_t i = 0; i < (i_t)A_indices.size(); ++i) {
       // Quadratic constraint rows are omitted from the linear CSR; linear pieces live in each
       // quadratic_constraint_t bundle.
-      if (quadratic_row_ids.count(i)) { continue; }
+      if (is_quadratic_row(i)) { continue; }
       ++num_linear_rows;
       for (const auto& idx_itr : A_indices[i]) {
         h_indices.push_back(idx_itr);
@@ -334,7 +337,7 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   std::vector<f_t> b_compacted{};
   b_compacted.reserve(b_values.size());
   for (i_t i = 0; i < (i_t)b_values.size(); ++i) {
-    if (!quadratic_row_ids.count(i)) { b_compacted.push_back(b_values[i]); }
+    if (!is_quadratic_row(i)) { b_compacted.push_back(b_values[i]); }
   }
   problem.set_constraint_bounds(b_compacted.data(), static_cast<i_t>(b_compacted.size()));
   problem.set_objective_coefficients(c_values.data(), c_values.size());
@@ -363,7 +366,7 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     std::vector<f_t> h_constraint_lower_bounds{};
     std::vector<f_t> h_constraint_upper_bounds{};
     for (i_t i = 0; i < (i_t)row_types.size(); ++i) {
-      if (quadratic_row_ids.count(i)) { continue; }
+      if (is_quadratic_row(i)) { continue; }
       if (row_types[i] == Equality) {
         h_constraint_lower_bounds.push_back(b_values[i]);
         h_constraint_upper_bounds.push_back(b_values[i]);
@@ -510,6 +513,8 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
 
     for (i_t row = 0; row < num_rows; ++row) {
       for (const auto& [col, val] : csr_data[row]) {
+        // While the mps format expects to optimize for 0.5 xT Q x, cuopt optimizes for xT Q xExpand commentComment on line L488
+        // so we have to multiply the value by value_scale=0.5 to get the correct value.
         result.values.push_back(val * value_scale);
         result.indices.push_back(col);
       }
@@ -553,8 +558,8 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   // QCMATRIX: one symmetric Q per constraint row (no extra ½ factor vs file coeffs).
   // Bundle row metadata, row-linear coefficients (from COLUMNS), rhs, and quadratic part together.
   constexpr f_t k_qcmatrix_value_scale = f_t(1);
-  const i_t linear_row_count           = static_cast<i_t>(row_types.size() - quadratic_row_ids.size());
-  i_t quadratic_row_id              = 0;
+  const i_t linear_row_count = static_cast<i_t>(row_types.size() - quadratic_row_ids.size());
+  i_t quadratic_row_id       = 0;
   for (const auto& block : qcmatrix_blocks_) {
     auto csr_result = build_csr_via_transpose(
       block.entries, num_vars_for_quad, num_vars_for_quad, false, k_qcmatrix_value_scale);
@@ -564,25 +569,16 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
       error_type_t::ValidationError,
       "QCMATRIX row index %d is out of range for constraints",
       static_cast<int>(row_id));
-    const i_t linear_nnz  = static_cast<i_t>(A_indices[row_id].size());
-    const f_t* linear_val = linear_nnz > 0 ? A_values[row_id].data() : nullptr;
-    const i_t* linear_idx = linear_nnz > 0 ? A_indices[row_id].data() : nullptr;
-
     problem.append_quadratic_constraint(
       linear_row_count + quadratic_row_id,
       row_names[row_id],
       static_cast<char>(row_types[row_id]),
-      linear_val,
-      linear_nnz,
-      linear_idx,
-      linear_nnz,
+      A_values[row_id],
+      A_indices[row_id],
       b_values[row_id],
-      csr_result.values.data(),
-      static_cast<i_t>(csr_result.values.size()),
-      csr_result.indices.data(),
-      static_cast<i_t>(csr_result.indices.size()),
-      csr_result.offsets.data(),
-      static_cast<i_t>(csr_result.offsets.size()));
+      csr_result.values,
+      csr_result.indices,
+      csr_result.offsets);
     ++quadratic_row_id;
   }
 
@@ -592,7 +588,7 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     linear_row_names.reserve(row_names.size());
     row_types_linear.reserve(row_names.size());
     for (size_t i = 0; i < row_names.size(); ++i) {
-      if (!quadratic_row_ids.count(static_cast<i_t>(i))) {
+      if (!is_quadratic_row(static_cast<i_t>(i))) {
         linear_row_names.push_back(row_names[i]);
         row_types_linear.push_back(static_cast<char>(row_types[i]));
       }

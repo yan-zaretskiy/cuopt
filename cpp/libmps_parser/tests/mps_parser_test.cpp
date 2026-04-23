@@ -883,20 +883,8 @@ TEST(qps_parser, qcmatrix_append_api)
   const std::vector<int> qc0_offsets    = {0, 2, 4};
   const std::vector<double> qc0_linear_values = {1.0, 1.0};
   const std::vector<int> qc0_linear_indices   = {0, 1};
-  model.append_quadratic_constraint(0,
-                                    "QC0",
-                                    'L',
-                                    qc0_linear_values.data(),
-                                    qc0_linear_values.size(),
-                                    qc0_linear_indices.data(),
-                                    qc0_linear_indices.size(),
-                                    5.0,
-                                    qc0_values.data(),
-                                    qc0_values.size(),
-                                    qc0_indices.data(),
-                                    qc0_indices.size(),
-                                    qc0_offsets.data(),
-                                    qc0_offsets.size());
+  model.append_quadratic_constraint(
+    0, "QC0", 'L', qc0_linear_values, qc0_linear_indices, 5.0, qc0_values, qc0_indices, qc0_offsets);
 
   // QC1: [[4, 1], [1, 6]]
   const std::vector<double> qc1_values  = {4.0, 1.0, 1.0, 6.0};
@@ -907,17 +895,12 @@ TEST(qps_parser, qcmatrix_append_api)
   model.append_quadratic_constraint(1,
                                     "QC1",
                                     'L',
-                                    qc1_linear_values.data(),
-                                    qc1_linear_values.size(),
-                                    qc1_linear_indices.data(),
-                                    qc1_linear_indices.size(),
+                                    qc1_linear_values,
+                                    qc1_linear_indices,
                                     10.0,
-                                    qc1_values.data(),
-                                    qc1_values.size(),
-                                    qc1_indices.data(),
-                                    qc1_indices.size(),
-                                    qc1_offsets.data(),
-                                    qc1_offsets.size());
+                                    qc1_values,
+                                    qc1_indices,
+                                    qc1_offsets);
 
   ASSERT_TRUE(model.has_quadratic_constraints());
   const auto& qcs = model.get_quadratic_constraints();
@@ -1337,7 +1320,9 @@ TEST(mps_roundtrip, qcqp_p0033_qc1)
 
   std::string input_file =
     cuopt::test::get_rapids_dataset_root_dir() + "/qcqp/p0033_qc1.mps";
-  std::string temp_file = "/tmp/mps_roundtrip_p0033_qc1.mps";
+  std::string temp_file   = "/tmp/mps_roundtrip_p0033_qc1.mps";
+  std::string temp_file_2 = "/tmp/mps_roundtrip_p0033_qc1_r2.mps";
+  std::string temp_file_3 = "/tmp/mps_roundtrip_p0033_qc1_r3.mps";
 
   auto original = parse_mps<int, double>(input_file, false);
   ASSERT_TRUE(original.has_quadratic_objective());
@@ -1347,9 +1332,13 @@ TEST(mps_roundtrip, qcqp_p0033_qc1)
   writer.write(temp_file);
 
   auto reloaded = parse_mps<int, double>(temp_file, false);
-  compare_data_models(original, reloaded);
+  mps_writer_t<int, double> writer_r2(reloaded);
+  writer_r2.write(temp_file_2);
+  auto reloaded_2 = parse_mps<int, double>(temp_file_2, false);
+  compare_data_models(reloaded, reloaded_2);
 
   std::filesystem::remove(temp_file);
+  std::filesystem::remove(temp_file_2);
 }
 
 }  // namespace cuopt::mps_parser

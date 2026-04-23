@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -287,23 +288,21 @@ class mps_data_model_t {
 
   /**
    * @brief Append one complete quadratic constraint (row + linear + rhs + quadratic Q).
+   * @param linear_values, linear_indices Same nnz; empty spans for a purely quadratic row (rare).
+   * @param quadratic_values, quadratic_indices CSR nnz; may be empty if Q is empty.
+   * @param quadratic_offsets CSR row starts; must be non-empty.
    * @param constraint_row_type MPS ROWS type; must be 'L'. 'G' and 'E' quadratic rows are not
    *        supported.
    */
   void append_quadratic_constraint(i_t constraint_row_index,
                                    const std::string& constraint_row_name,
                                    char constraint_row_type,
-                                   const f_t* linear_values,
-                                   i_t linear_nnz,
-                                   const i_t* linear_indices,
-                                   i_t linear_indices_nnz,
+                                   std::span<const f_t> linear_values,
+                                   std::span<const i_t> linear_indices,
                                    f_t rhs_value,
-                                   const f_t* quadratic_values,
-                                   i_t quadratic_size_values,
-                                   const i_t* quadratic_indices,
-                                   i_t quadratic_size_indices,
-                                   const i_t* quadratic_offsets,
-                                   i_t quadratic_size_offsets);
+                                   std::span<const f_t> quadratic_values,
+                                   std::span<const i_t> quadratic_indices,
+                                   std::span<const i_t> quadratic_offsets);
 
   const std::vector<quadratic_constraint_t>& get_quadratic_constraints() const;
 
