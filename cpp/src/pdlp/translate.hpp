@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cuopt/error.hpp>
 #include <cuopt/linear_programming/optimization_problem_interface.hpp>
 
 #include <dual_simplex/presolve.hpp>
@@ -33,8 +34,6 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
   csr_A.x = std::vector<f_t>(cuopt::host_copy(model.coefficients, handle_ptr->get_stream()));
   csr_A.j = std::vector<i_t>(cuopt::host_copy(model.variables, handle_ptr->get_stream()));
   csr_A.row_start = std::vector<i_t>(cuopt::host_copy(model.offsets, handle_ptr->get_stream()));
-
-  csr_A.to_compressed_col(user_problem.A);
 
   user_problem.rhs.resize(m);
   user_problem.row_sense.resize(m);
@@ -104,6 +103,188 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
   user_problem.Q_offsets = model.Q_offsets;
   user_problem.Q_indices = model.Q_indices;
   user_problem.Q_values  = model.Q_values;
+
+  if (model.original_problem_ptr->has_quadratic_constraints()) {
+    const auto& qcs = model.original_problem_ptr->get_quadratic_constraints();
+    cuopt_expects(!qcs.empty(),
+                  error_type_t::ValidationError,
+                  "Quadratic-constraint flag is set, but no constraints were provided");
+
+    const i_t original_rows = static_cast<i_t>(user_problem.num_rows);
+    const f_t tol             = f_t(1e-16);
+
+    // SOC: Q is n×n diagonal CSR (offsets length n+1). Exactly q_n = nnz on the main diagonal, at
+    // q_n distinct variable indices: one −1 (head) and (q_n−1) +1 (tails). Lifting: q_n rows, each
+    // with −1 in one column; the **first** row must be the head (variable with Q = −1); order of
+    // remaining rows (+1 diagonals) is unconstrained (CSR row scan order).
+
+    const i_t old_nnz = csr_A.row_start[original_rows];
+    std::vector<i_t> row_cone_dims{};
+    row_cone_dims.reserve(qcs.size());
+
+    for (const auto& qc : qcs) {
+      cuopt_expects(qc.constraint_row_type == 'L',
+                    error_type_t::ValidationError,
+                    "Only <= quadratic constraints are supported for SOC conversion");
+      cuopt_expects(qc.linear_values.empty(),
+                    error_type_t::ValidationError,
+                    "SOC conversion currently requires zero linear terms in quadratic constraints");
+      cuopt_expects(qc.rhs_value < tol && qc.rhs_value > -tol,
+                    error_type_t::ValidationError,
+                    "SOC conversion currently requires rhs = 0 for quadratic constraints");
+
+      cuopt_expects(qc.quadratic_offsets.size() >= 2,
+                    error_type_t::ValidationError,
+                    "Quadratic constraint '%s' has invalid CSR offsets (need at least 2 entries)",
+                    qc.constraint_row_name.c_str());
+      cuopt_expects(
+        qc.quadratic_values.size() == qc.quadratic_indices.size(),
+        error_type_t::ValidationError,
+        "Quadratic constraint '%s' quadratic_values and quadratic_indices length mismatch for CSR Q",
+        qc.constraint_row_name.c_str());
+
+      const i_t q_n = static_cast<i_t>(qc.quadratic_values.size());
+      cuopt_expects(q_n >= 2,
+                    error_type_t::ValidationError,
+                    "Quadratic constraint '%s' SOC must have at least 2 diagonal entries in Q (nnz "
+                    "%d)",
+                    qc.constraint_row_name.c_str(),
+                    static_cast<int>(q_n));
+
+      cuopt_expects(
+        qc.quadratic_offsets.size() == static_cast<size_t>(n) + 1,
+        error_type_t::ValidationError,
+        "Quadratic constraint '%s' Q must be n×n in CSR: expected %zu CSR row pointers (offsets "
+        "length n+1), got %zu (n = %d)",
+        qc.constraint_row_name.c_str(),
+        static_cast<size_t>(n) + 1,
+        qc.quadratic_offsets.size(),
+        static_cast<int>(n));
+      cuopt_expects(
+        qc.quadratic_offsets[static_cast<size_t>(n)] == q_n,
+        error_type_t::ValidationError,
+        "Quadratic constraint '%s' Q last CSR offset %d must equal number of nonzeros (nnz) %d for "
+        "this diagonal Q",
+        qc.constraint_row_name.c_str(),
+        static_cast<int>(qc.quadratic_offsets[static_cast<size_t>(n)]),
+        static_cast<int>(q_n));
+      cuopt_expects(
+        qc.quadratic_offsets[0] == 0,
+        error_type_t::ValidationError,
+        "Quadratic constraint '%s' Q CSR offsets[0] must be 0",
+        qc.constraint_row_name.c_str());
+
+      // Verify Q: n×n CSR, diagonal entries only, Lorentz pattern, then build the lift.
+      // Scan each row r: empty or one nnz on (r,r) with value -1 (head) or +1 (tail);
+      // tail order follows this scan; no requirement that diagonal indices be sorted.
+      i_t head     = static_cast<i_t>(-1);
+      i_t n_head_m = 0;
+      std::vector<i_t> tail_row_vars{};
+      tail_row_vars.reserve(static_cast<size_t>(q_n - 1));
+
+      for (i_t r = 0; r < n; ++r) {
+        const i_t p_beg = qc.quadratic_offsets[static_cast<size_t>(r)];
+        const i_t p_end = qc.quadratic_offsets[static_cast<size_t>(r + 1)];
+
+        if (p_beg == p_end) { continue; }
+
+        cuopt_expects(
+          p_beg + 1 == p_end,
+          error_type_t::ValidationError,
+          "Quadratic constraint '%s' Q row %d: expected at most one stored entry on the diagonal per "
+          "row (got end - beg = %d)",
+          qc.constraint_row_name.c_str(),
+          static_cast<int>(r),
+          static_cast<int>(p_end - p_beg));
+
+        const i_t col = qc.quadratic_indices[static_cast<size_t>(p_beg)];
+        const f_t v   = qc.quadratic_values[static_cast<size_t>(p_beg)];
+        cuopt_expects(
+          col == r,
+          error_type_t::ValidationError,
+          "Quadratic constraint '%s' Q row %d: only main diagonal (j,j) entries are allowed; got "
+          "column %d",
+          qc.constraint_row_name.c_str(),
+          static_cast<int>(r),
+          static_cast<int>(col));
+
+        if (v > f_t(-1) - tol && v < f_t(-1) + tol) {
+          ++n_head_m;
+          head = r;
+        } else if (v > f_t(1) - tol && v < f_t(1) + tol) {
+          tail_row_vars.push_back(r);
+        } else {
+          cuopt_expects(
+            false,
+            error_type_t::ValidationError,
+            "Quadratic constraint '%s' Q row %d: diagonal for SOC must be -1 (head) or +1 (tail); got "
+            "%g",
+            qc.constraint_row_name.c_str(),
+            static_cast<int>(r),
+            static_cast<double>(v));
+        }
+      }
+      cuopt_expects(
+        n_head_m == 1,
+        error_type_t::ValidationError,
+        "Quadratic constraint '%s' SOC Q: expected exactly one diagonal with value -1 (cone head), "
+        "found %d",
+        qc.constraint_row_name.c_str(),
+        static_cast<int>(n_head_m));
+      cuopt_expects(
+        static_cast<i_t>(tail_row_vars.size()) == q_n - 1,
+        error_type_t::ValidationError,
+        "Quadratic constraint '%s' SOC Q: expected %d diagonals with value +1 (tails), found %zu",
+        qc.constraint_row_name.c_str(),
+        static_cast<int>(q_n - 1),
+        tail_row_vars.size());
+      cuopt_expects(
+        head >= 0,
+        error_type_t::ValidationError,
+        "Quadratic constraint '%s' SOC Q: internal error (head index invalid)",
+        qc.constraint_row_name.c_str());
+
+      row_cone_dims.push_back(q_n);
+      dual_simplex::csr_matrix_t<i_t, f_t> lift_block(q_n, n, q_n);
+      for (i_t t = 0; t <= q_n; ++t) {
+        lift_block.row_start[t] = t;
+      }
+
+      // One lift row per cone component: -1 in column head, then -1 in each tail column
+      // (order matches tail_row_vars from the Q scan).
+      lift_block.j[0] = head;
+      lift_block.x[0] = f_t(-1);
+      for (i_t t = 0; t < q_n - 1; ++t) {
+        lift_block.j[static_cast<size_t>(t) + 1U] = tail_row_vars[static_cast<size_t>(t)];
+        lift_block.x[static_cast<size_t>(t) + 1U] = f_t(-1);
+      }
+      cuopt_expects(csr_A.append_rows(lift_block) == 0,
+                    error_type_t::RuntimeError,
+                    "Internal error while appending SOC lifting rows to CSR A");
+    }
+
+    // Update user_problem to include the new SOC rows
+    const i_t next_row    = static_cast<i_t>(csr_A.m);
+    const i_t lifted_rows = next_row - original_rows;
+    const i_t new_nnz     = old_nnz + lifted_rows;
+    cuopt_expects(csr_A.row_start[next_row] == new_nnz,
+                  error_type_t::RuntimeError,
+                  "Internal error while building SOC lifting rows in CSR A");
+
+    user_problem.rhs.resize(next_row, f_t(0));
+    user_problem.row_sense.resize(next_row, 'E');
+    if (user_problem.row_names.size() == static_cast<size_t>(original_rows)) {
+      for (i_t r = original_rows; r < next_row; ++r) {
+        user_problem.row_names.push_back("_CUOPT_soc_row_" + std::to_string(r - original_rows));
+      }
+    }
+    user_problem.num_rows = next_row;
+
+    user_problem.cone_row_start = original_rows;
+    user_problem.second_order_cone_row_dims = std::move(row_cone_dims);
+  }
+
+  csr_A.to_compressed_col(user_problem.A);
 
   return user_problem;
 }

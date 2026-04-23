@@ -1378,12 +1378,17 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
     // This needs to be called before pdlp is initialized
     init_handler(op_problem.get_handle_ptr());
 
-    if (op_problem.has_quadratic_objective()) {
-      CUOPT_LOG_INFO("Problem has a quadratic objective. Using Barrier.");
+    if (op_problem.has_quadratic_objective() || op_problem.has_quadratic_constraints()) {
+      if (op_problem.has_quadratic_objective()) {
+        CUOPT_LOG_INFO("Problem has a quadratic objective. Using Barrier.");
+      }
+      if (op_problem.has_quadratic_constraints()) {
+        CUOPT_LOG_INFO("Problem has quadratic constraints. Using Barrier with SOC conversion.");
+      }
       settings.method    = method_t::Barrier;
       settings.presolver = presolver_t::None;
-      // check for sense of the problem
-      if (op_problem.get_sense()) {
+      // Quadratic objective support is minimization-only.
+      if (op_problem.has_quadratic_objective() && op_problem.get_sense()) {
         CUOPT_LOG_ERROR("Quadratic problems must be minimized");
         return optimization_problem_solution_t<i_t, f_t>(pdlp_termination_status_t::NumericalError,
                                                          op_problem.get_handle_ptr()->get_stream());
