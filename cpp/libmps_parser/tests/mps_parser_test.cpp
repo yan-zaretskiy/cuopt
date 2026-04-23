@@ -1322,7 +1322,6 @@ TEST(mps_roundtrip, qcqp_p0033_qc1)
     cuopt::test::get_rapids_dataset_root_dir() + "/qcqp/p0033_qc1.mps";
   std::string temp_file   = "/tmp/mps_roundtrip_p0033_qc1.mps";
   std::string temp_file_2 = "/tmp/mps_roundtrip_p0033_qc1_r2.mps";
-  std::string temp_file_3 = "/tmp/mps_roundtrip_p0033_qc1_r3.mps";
 
   auto original = parse_mps<int, double>(input_file, false);
   ASSERT_TRUE(original.has_quadratic_objective());
