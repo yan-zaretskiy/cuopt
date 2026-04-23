@@ -1320,7 +1320,9 @@ TEST(mps_roundtrip, qcqp_p0033_qc1)
 
   std::string input_file =
     cuopt::test::get_rapids_dataset_root_dir() + "/qcqp/p0033_qc1.mps";
-  std::string temp_file = "/tmp/mps_roundtrip_p0033_qc1.mps";
+  std::string temp_file   = "/tmp/mps_roundtrip_p0033_qc1.mps";
+  std::string temp_file_2 = "/tmp/mps_roundtrip_p0033_qc1_r2.mps";
+  std::string temp_file_3 = "/tmp/mps_roundtrip_p0033_qc1_r3.mps";
 
   auto original = parse_mps<int, double>(input_file, false);
   ASSERT_TRUE(original.has_quadratic_objective());
@@ -1330,9 +1332,13 @@ TEST(mps_roundtrip, qcqp_p0033_qc1)
   writer.write(temp_file);
 
   auto reloaded = parse_mps<int, double>(temp_file, false);
-  compare_data_models(original, reloaded);
+  mps_writer_t<int, double> writer_r2(reloaded);
+  writer_r2.write(temp_file_2);
+  auto reloaded_2 = parse_mps<int, double>(temp_file_2, false);
+  compare_data_models(reloaded, reloaded_2);
 
   std::filesystem::remove(temp_file);
+  std::filesystem::remove(temp_file_2);
 }
 
 }  // namespace cuopt::mps_parser
