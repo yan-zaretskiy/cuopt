@@ -235,7 +235,8 @@ void mps_writer_t<i_t, f_t>::write(const std::string& mps_file_path)
   for (size_t k = 0; k < static_cast<size_t>(n_constraints); ++k) {
     std::string row_name =
       k < problem_.get_row_names().size() ? problem_.get_row_names()[k] : "R" + std::to_string(k);
-    char const type = linear_row_type_from_bounds(constraint_lower_bounds[k], constraint_upper_bounds[k]);
+    char const type =
+      linear_row_type_from_bounds(constraint_lower_bounds[k], constraint_upper_bounds[k]);
     mps_file << " " << type << "  " << row_name << "\n";
   }
   for (size_t q = 0; q < quadratic_constraints.size(); ++q) {
@@ -255,7 +256,8 @@ void mps_writer_t<i_t, f_t>::write(const std::string& mps_file_path)
   std::map<i_t, std::vector<std::pair<i_t, f_t>>> integral_col_nnzs;
   std::map<i_t, std::vector<std::pair<i_t, f_t>>> continuous_col_nnzs;
 
-  // iterate over the constraint matrix and add the nonzeros to the integral and continuous col_nnzs maps
+  // iterate over the constraint matrix and add the nonzeros to the integral and continuous col_nnzs
+  // maps
   for (size_t csr_row = 0; csr_row < (size_t)n_constraints; csr_row++) {
     const i_t row_id = static_cast<i_t>(csr_row);
     for (size_t k = (size_t)constraint_matrix_offsets[csr_row];
@@ -498,8 +500,8 @@ void mps_writer_t<i_t, f_t>::write(const std::string& mps_file_path)
                                      ? problem_.get_variable_names()[i]
                                      : "C" + std::to_string(i);
         for (i_t p = qc.quadratic_offsets[i]; p < qc.quadratic_offsets[i + 1]; ++p) {
-          i_t j         = qc.quadratic_indices[p];
-          f_t v         = qc.quadratic_values[p];
+          i_t j                    = qc.quadratic_indices[p];
+          f_t v                    = qc.quadratic_values[p];
           std::string col_var_name = static_cast<size_t>(j) < problem_.get_variable_names().size()
                                        ? problem_.get_variable_names()[j]
                                        : "C" + std::to_string(j);

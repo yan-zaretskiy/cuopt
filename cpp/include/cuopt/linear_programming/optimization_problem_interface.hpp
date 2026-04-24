@@ -75,7 +75,8 @@ class optimization_problem_interface_t {
    * @brief Store quadratic constraints for MPS round-trip (linear + Q parts per QC row).
    */
   virtual void set_quadratic_constraints(std::vector<quadratic_constraint_t> constraints) = 0;
-  template <typename qc_t, typename = std::enable_if_t<!std::is_same_v<qc_t, quadratic_constraint_t>>>
+  template <typename qc_t,
+            typename = std::enable_if_t<!std::is_same_v<qc_t, quadratic_constraint_t>>>
   void set_quadratic_constraints(const std::vector<qc_t>& constraints)
   {
     std::vector<quadratic_constraint_t> converted_constraints;

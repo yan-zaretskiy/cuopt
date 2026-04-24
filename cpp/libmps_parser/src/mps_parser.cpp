@@ -278,7 +278,9 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   for (const auto& block : qcmatrix_blocks_) {
     quadratic_row_ids.insert(block.constraint_row_id);
   }
-  const auto is_quadratic_row = [&quadratic_row_ids](i_t row) { return quadratic_row_ids.count(row); };
+  const auto is_quadratic_row = [&quadratic_row_ids](i_t row) {
+    return quadratic_row_ids.count(row);
+  };
 
   {
     std::vector<i_t> h_offsets{}, h_indices{};
@@ -307,13 +309,12 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
                                       h_offsets.data(),
                                       h_offsets.size());
 
-    mps_parser_expects(
-      static_cast<size_t>(num_linear_rows) + 1 == h_offsets.size(),
-      error_type_t::ValidationError,
-      "The row indexing vector for the constraint matrix was not constructed "
-      "successfully. Should be size %zu, but was size %zu",
-      static_cast<size_t>(num_linear_rows) + 1,
-      h_offsets.size());
+    mps_parser_expects(static_cast<size_t>(num_linear_rows) + 1 == h_offsets.size(),
+                       error_type_t::ValidationError,
+                       "The row indexing vector for the constraint matrix was not constructed "
+                       "successfully. Should be size %zu, but was size %zu",
+                       static_cast<size_t>(num_linear_rows) + 1,
+                       h_offsets.size());
     mps_parser_expects(
       h_indices.size() == h_values.size(),
       error_type_t::ValidationError,
@@ -330,7 +331,6 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
       "nonzero vector. Nonzero has size %zu but the last offset is %d.",
       h_values.size(),
       h_offsets[h_offsets.size() - 1]);
-
   }
 
   // Set b & c (RHS entries for quadratic rows are stored only on quadratic_constraint_t)
@@ -361,7 +361,8 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     problem.get_variable_lower_bounds().size(),
     problem.get_variable_upper_bounds().size());
 
-  // Determine the constraint bounds based on row types (quadratic rows use bundles only, not counted here)
+  // Determine the constraint bounds based on row types (quadratic rows use bundles only, not
+  // counted here)
   {
     std::vector<f_t> h_constraint_lower_bounds{};
     std::vector<f_t> h_constraint_upper_bounds{};
@@ -463,11 +464,12 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
   problem.set_variable_types(std::move(var_types));
   problem.set_maximize(maximize);
 
-  // Helper function to build CSR format using double transpose (O(m+n+nnz) instead of O(nnz*log(nnz))) 
-  // For QUADOBJ: handles upper triangular input by expanding to full symmetric matrix. 
-  // 
-  // @p value_scale: 
-  // QUADOBJ/QMATRIX use 0.5 (MPS ½ xᵀQx vs internal xᵀQx); 
+  // Helper function to build CSR format using double transpose (O(m+n+nnz) instead of
+  // O(nnz*log(nnz))) For QUADOBJ: handles upper triangular input by expanding to full symmetric
+  // matrix.
+  //
+  // @p value_scale:
+  // QUADOBJ/QMATRIX use 0.5 (MPS ½ xᵀQx vs internal xᵀQx);
   // QCMATRIX uses 1.0 (symmetric Q defines xᵀQx directly in the constraint).
   auto build_csr_via_transpose = [](const std::vector<std::tuple<i_t, i_t, f_t>>& entries,
                                     i_t num_rows,
@@ -513,8 +515,9 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
 
     for (i_t row = 0; row < num_rows; ++row) {
       for (const auto& [col, val] : csr_data[row]) {
-        // While the mps format expects to optimize for 0.5 xT Q x, cuopt optimizes for xT Q xExpand commentComment on line L488
-        // so we have to multiply the value by value_scale=0.5 to get the correct value.
+        // While the mps format expects to optimize for 0.5 xT Q x, cuopt optimizes for xT Q xExpand
+        // commentComment on line L488 so we have to multiply the value by value_scale=0.5 to get
+        // the correct value.
         result.values.push_back(val * value_scale);
         result.indices.push_back(col);
       }
@@ -529,8 +532,8 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     // Convert quadratic objective entries to CSR format using double transpose
     // QUADOBJ stores upper triangular elements, so we expand to full symmetric matrix
     constexpr f_t k_mps_quad_half_scale = f_t(0.5);  // MPS ½ xᵀQx vs internal xᵀQx
-    auto csr_result =
-      build_csr_via_transpose(quadobj_entries, num_vars_for_quad, num_vars_for_quad, true, k_mps_quad_half_scale);
+    auto csr_result                     = build_csr_via_transpose(
+      quadobj_entries, num_vars_for_quad, num_vars_for_quad, true, k_mps_quad_half_scale);
 
     // Use optimized double transpose method - O(m+n+nnz) instead of O(nnz*log(nnz))
     problem.set_quadratic_objective_matrix(csr_result.values.data(),
@@ -543,8 +546,8 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     // Convert quadratic objective entries to CSR format using double transpose
     // QMATRIX stores full symmetric matrix
     constexpr f_t k_mps_quad_half_scale = f_t(0.5);
-    auto csr_result =
-      build_csr_via_transpose(qmatrix_entries, num_vars_for_quad, num_vars_for_quad, false, k_mps_quad_half_scale);
+    auto csr_result                     = build_csr_via_transpose(
+      qmatrix_entries, num_vars_for_quad, num_vars_for_quad, false, k_mps_quad_half_scale);
 
     // Use optimized double transpose method - O(m+n+nnz) instead of O(nnz*log(nnz))
     problem.set_quadratic_objective_matrix(csr_result.values.data(),
@@ -564,21 +567,24 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
     auto csr_result = build_csr_via_transpose(
       block.entries, num_vars_for_quad, num_vars_for_quad, false, k_qcmatrix_value_scale);
     const i_t row_id = block.constraint_row_id;
-    mps_parser_expects(
-      row_id >= 0 && row_id < static_cast<i_t>(row_types.size()),
-      error_type_t::ValidationError,
-      "QCMATRIX row index %d is out of range for constraints",
-      static_cast<int>(row_id));
-    problem.append_quadratic_constraint(
-      linear_row_count + quadratic_row_id,
-      row_names[row_id],
-      static_cast<char>(row_types[row_id]),
-      A_values[row_id],
-      A_indices[row_id],
-      b_values[row_id],
-      csr_result.values,
-      csr_result.indices,
-      csr_result.offsets);
+    mps_parser_expects(row_id >= 0 && row_id < static_cast<i_t>(row_types.size()),
+                       error_type_t::ValidationError,
+                       "QCMATRIX row index %d is out of range for constraints",
+                       static_cast<int>(row_id));
+    problem.append_quadratic_constraint(linear_row_count + quadratic_row_id,
+                                        row_names[row_id],
+                                        static_cast<char>(row_types[row_id]),
+                                        A_values[row_id].data(),
+                                        static_cast<i_t>(A_values[row_id].size()),
+                                        A_indices[row_id].data(),
+                                        static_cast<i_t>(A_indices[row_id].size()),
+                                        b_values[row_id],
+                                        csr_result.values.data(),
+                                        static_cast<i_t>(csr_result.values.size()),
+                                        csr_result.indices.data(),
+                                        static_cast<i_t>(csr_result.indices.size()),
+                                        csr_result.offsets.data(),
+                                        static_cast<i_t>(csr_result.offsets.size()));
     ++quadratic_row_id;
   }
 
@@ -1415,7 +1421,7 @@ void mps_parser_t<i_t, f_t>::parse_qcmatrix_header(std::string_view line)
                        error_type_t::ValidationError,
                        "QCMATRIX header line too short! line=%s",
                        std::string(line).c_str());
-    //fixed MPS: constraint name starts in column 12 (1-based) → 0-based index 11, 8 chars
+    // fixed MPS: constraint name starts in column 12 (1-based) → 0-based index 11, 8 chars
     row_name = std::string(trim(line.substr(11, 8)));
   } else {
     std::stringstream ss{std::string(line)};
@@ -1466,8 +1472,8 @@ void mps_parser_t<i_t, f_t>::parse_qcmatrix_data(std::string_view line)
     i_t pos = 24;
     value   = get_numerical_bound<false>(line, pos);
   } else {
-    i_t pos = 0;
-    i_t end = 0;
+    i_t pos                        = 0;
+    i_t end                        = 0;
     const std::string_view var1_sv = get_next_string(line, pos, end);
     mps_parser_expects(!var1_sv.empty(),
                        error_type_t::ValidationError,
@@ -1524,8 +1530,8 @@ void mps_parser_t<i_t, f_t>::parse_quad(std::string_view line, bool is_quadobj)
     i_t pos = 24;
     value   = get_numerical_bound<false>(line, pos);
   } else {
-    i_t pos = 0;
-    i_t end = 0;
+    i_t pos                        = 0;
+    i_t end                        = 0;
     const std::string_view var1_sv = get_next_string(line, pos, end);
     mps_parser_expects(!var1_sv.empty(),
                        error_type_t::ValidationError,

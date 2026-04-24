@@ -135,7 +135,8 @@ void cpu_optimization_problem_t<i_t, f_t>::set_quadratic_objective_matrix(
 
 template <typename i_t, typename f_t>
 void cpu_optimization_problem_t<i_t, f_t>::set_quadratic_constraints(
-  std::vector<typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t> constraints)
+  std::vector<typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t>
+    constraints)
 {
   quadratic_constraints_ = std::move(constraints);
 }
