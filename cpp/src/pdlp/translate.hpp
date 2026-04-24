@@ -111,7 +111,8 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
                   "Quadratic-constraint flag is set, but no constraints were provided");
 
     const i_t original_rows = static_cast<i_t>(user_problem.num_rows);
-    const f_t tol             = f_t(1e-16);
+    // Use a practical tolerance for text-parsed MPS numeric values.
+    const f_t tol = std::numeric_limits<f_t>::epsilon() * 2;
 
     // SOC: Q is n×n diagonal CSR (offsets length n+1). Exactly q_n = nnz on the main diagonal, at
     // q_n distinct variable indices: one −1 (head) and (q_n−1) +1 (tails). Lifting: q_n rows, each
@@ -137,11 +138,11 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
                     error_type_t::ValidationError,
                     "Quadratic constraint '%s' has invalid CSR offsets (need at least 2 entries)",
                     qc.constraint_row_name.c_str());
-      cuopt_expects(
-        qc.quadratic_values.size() == qc.quadratic_indices.size(),
-        error_type_t::ValidationError,
-        "Quadratic constraint '%s' quadratic_values and quadratic_indices length mismatch for CSR Q",
-        qc.constraint_row_name.c_str());
+      cuopt_expects(qc.quadratic_values.size() == qc.quadratic_indices.size(),
+                    error_type_t::ValidationError,
+                    "Quadratic constraint '%s' quadratic_values and quadratic_indices length "
+                    "mismatch for CSR Q",
+                    qc.constraint_row_name.c_str());
 
       const i_t q_n = static_cast<i_t>(qc.quadratic_values.size());
       cuopt_expects(q_n >= 2,
@@ -168,11 +169,10 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
         qc.constraint_row_name.c_str(),
         static_cast<int>(qc.quadratic_offsets[static_cast<size_t>(n)]),
         static_cast<int>(q_n));
-      cuopt_expects(
-        qc.quadratic_offsets[0] == 0,
-        error_type_t::ValidationError,
-        "Quadratic constraint '%s' Q CSR offsets[0] must be 0",
-        qc.constraint_row_name.c_str());
+      cuopt_expects(qc.quadratic_offsets[0] == 0,
+                    error_type_t::ValidationError,
+                    "Quadratic constraint '%s' Q CSR offsets[0] must be 0",
+                    qc.constraint_row_name.c_str());
 
       // Verify Q: n×n CSR, diagonal entries only, Lorentz pattern, then build the lift.
       // Scan each row r: empty or one nnz on (r,r) with value -1 (head) or +1 (tail);
@@ -188,14 +188,14 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
 
         if (p_beg == p_end) { continue; }
 
-        cuopt_expects(
-          p_beg + 1 == p_end,
-          error_type_t::ValidationError,
-          "Quadratic constraint '%s' Q row %d: expected at most one stored entry on the diagonal per "
-          "row (got end - beg = %d)",
-          qc.constraint_row_name.c_str(),
-          static_cast<int>(r),
-          static_cast<int>(p_end - p_beg));
+        cuopt_expects(p_beg + 1 == p_end,
+                      error_type_t::ValidationError,
+                      "Quadratic constraint '%s' Q row %d: expected at most one stored entry on "
+                      "the diagonal per "
+                      "row (got end - beg = %d)",
+                      qc.constraint_row_name.c_str(),
+                      static_cast<int>(r),
+                      static_cast<int>(p_end - p_beg));
 
         const i_t col = qc.quadratic_indices[static_cast<size_t>(p_beg)];
         const f_t v   = qc.quadratic_values[static_cast<size_t>(p_beg)];
@@ -208,20 +208,24 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
           static_cast<int>(r),
           static_cast<int>(col));
 
-        if (v > f_t(-1) - tol && v < f_t(-1) + tol) {
+        const f_t neg_one_delta = v + f_t(1);
+        const f_t pos_one_delta = v - f_t(1);
+        const bool is_neg_one   = (neg_one_delta >= -tol && neg_one_delta <= tol);
+        const bool is_pos_one   = (pos_one_delta >= -tol && pos_one_delta <= tol);
+        if (is_neg_one) {
           ++n_head_m;
           head = r;
-        } else if (v > f_t(1) - tol && v < f_t(1) + tol) {
+        } else if (is_pos_one) {
           tail_row_vars.push_back(r);
         } else {
-          cuopt_expects(
-            false,
-            error_type_t::ValidationError,
-            "Quadratic constraint '%s' Q row %d: diagonal for SOC must be -1 (head) or +1 (tail); got "
-            "%g",
-            qc.constraint_row_name.c_str(),
-            static_cast<int>(r),
-            static_cast<double>(v));
+          cuopt_expects(false,
+                        error_type_t::ValidationError,
+                        "Quadratic constraint '%s' Q row %d: diagonal for SOC must be -1 (head) or "
+                        "+1 (tail); got "
+                        "%.17g",
+                        qc.constraint_row_name.c_str(),
+                        static_cast<int>(r),
+                        static_cast<double>(v));
         }
       }
       cuopt_expects(
@@ -238,11 +242,10 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
         qc.constraint_row_name.c_str(),
         static_cast<int>(q_n - 1),
         tail_row_vars.size());
-      cuopt_expects(
-        head >= 0,
-        error_type_t::ValidationError,
-        "Quadratic constraint '%s' SOC Q: internal error (head index invalid)",
-        qc.constraint_row_name.c_str());
+      cuopt_expects(head >= 0,
+                    error_type_t::ValidationError,
+                    "Quadratic constraint '%s' SOC Q: internal error (head index invalid)",
+                    qc.constraint_row_name.c_str());
 
       row_cone_dims.push_back(q_n);
       dual_simplex::csr_matrix_t<i_t, f_t> lift_block(q_n, n, q_n);
@@ -250,8 +253,8 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
         lift_block.row_start[t] = t;
       }
 
-      // One lift row per cone component: -1 in column head, then -1 in each tail column
-      // (order matches tail_row_vars from the Q scan).
+      // One lift row per cone component: -1 in column head, then -1 in each tail column (since our
+      // slack variable is done by + s form) (order matches tail_row_vars from the Q scan).
       lift_block.j[0] = head;
       lift_block.x[0] = f_t(-1);
       for (i_t t = 0; t < q_n - 1; ++t) {
@@ -280,7 +283,7 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
     }
     user_problem.num_rows = next_row;
 
-    user_problem.cone_row_start = original_rows;
+    user_problem.cone_row_start             = original_rows;
     user_problem.second_order_cone_row_dims = std::move(row_cone_dims);
   }
 
