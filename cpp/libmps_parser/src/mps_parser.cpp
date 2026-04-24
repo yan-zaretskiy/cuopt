@@ -573,12 +573,17 @@ void mps_parser_t<i_t, f_t>::fill_problem(mps_data_model_t<i_t, f_t>& problem)
       linear_row_count + quadratic_row_id,
       row_names[row_id],
       static_cast<char>(row_types[row_id]),
-      A_values[row_id],
-      A_indices[row_id],
+      A_values[row_id].data(),
+      static_cast<i_t>(A_values[row_id].size()),
+      A_indices[row_id].data(),
+      static_cast<i_t>(A_indices[row_id].size()),
       b_values[row_id],
-      csr_result.values,
-      csr_result.indices,
-      csr_result.offsets);
+      csr_result.values.data(),
+      static_cast<i_t>(csr_result.values.size()),
+      csr_result.indices.data(),
+      static_cast<i_t>(csr_result.indices.size()),
+      csr_result.offsets.data(),
+      static_cast<i_t>(csr_result.offsets.size()));
     ++quadratic_row_id;
   }
 

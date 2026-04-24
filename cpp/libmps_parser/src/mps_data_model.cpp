@@ -224,12 +224,17 @@ template <typename i_t, typename f_t>
 void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_index,
                                                              const std::string& constraint_row_name,
                                                              char constraint_row_type,
-                                                             std::span<const f_t> linear_values,
-                                                             std::span<const i_t> linear_indices,
+                                                             const f_t* linear_values,
+                                                             i_t linear_nnz,
+                                                             const i_t* linear_indices,
+                                                             i_t linear_indices_nnz,
                                                              f_t rhs_value,
-                                                             std::span<const f_t> quadratic_values,
-                                                             std::span<const i_t> quadratic_indices,
-                                                             std::span<const i_t> quadratic_offsets)
+                                                             const f_t* quadratic_values,
+                                                             i_t quadratic_size_values,
+                                                             const i_t* quadratic_indices,
+                                                             i_t quadratic_size_indices,
+                                                             const i_t* quadratic_offsets,
+                                                             i_t quadratic_size_offsets)
 {
   mps_parser_expects(
     constraint_row_index >= 0, error_type_t::ValidationError, "constraint_row_index must be non-negative");
@@ -240,13 +245,28 @@ void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_
                      "Only 'L' is supported for convex quadratic constraints.",
                      constraint_row_type);
 
-  mps_parser_expects(
-    linear_values.size() == linear_indices.size(),
-    error_type_t::ValidationError,
-    "linear_values and linear_indices must have the same length");
+  mps_parser_expects(linear_nnz == linear_indices_nnz,
+                     error_type_t::ValidationError,
+                     "linear_values and linear_indices must have the same nnz count");
+  if (linear_nnz != 0) {
+    mps_parser_expects(
+      linear_values != nullptr && linear_indices != nullptr,
+      error_type_t::ValidationError,
+      "linear_values and linear_indices cannot be null when linear_nnz > 0");
+  }
 
+  if (quadratic_size_values != 0) {
+    mps_parser_expects(
+      quadratic_values != nullptr, error_type_t::ValidationError, "quadratic_values cannot be null");
+  }
   mps_parser_expects(
-    !quadratic_offsets.empty(), error_type_t::ValidationError, "quadratic_offsets cannot be empty");
+    quadratic_offsets != nullptr, error_type_t::ValidationError, "quadratic_offsets cannot be null");
+  if (quadratic_size_indices != 0) {
+    mps_parser_expects(
+      quadratic_indices != nullptr, error_type_t::ValidationError, "quadratic_indices cannot be null");
+  }
+  mps_parser_expects(
+    quadratic_size_offsets > 0, error_type_t::ValidationError, "quadratic_size_offsets cannot be empty");
 
   quadratic_constraint_t qc;
   qc.constraint_row_index = constraint_row_index;
@@ -254,11 +274,26 @@ void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_
   qc.constraint_row_type  = constraint_row_type;
   qc.rhs_value            = rhs_value;
 
-  qc.linear_values.assign(linear_values.begin(), linear_values.end());
-  qc.linear_indices.assign(linear_indices.begin(), linear_indices.end());
-  qc.quadratic_values.assign(quadratic_values.begin(), quadratic_values.end());
-  qc.quadratic_indices.assign(quadratic_indices.begin(), quadratic_indices.end());
-  qc.quadratic_offsets.assign(quadratic_offsets.begin(), quadratic_offsets.end());
+  qc.linear_values.resize(linear_nnz);
+  qc.linear_indices.resize(linear_nnz);
+  if (linear_nnz > 0) {
+    std::copy(linear_values, linear_values + linear_nnz, qc.linear_values.data());
+    std::copy(linear_indices, linear_indices + linear_nnz, qc.linear_indices.data());
+  }
+
+  qc.quadratic_values.resize(quadratic_size_values);
+  if (quadratic_size_values > 0) {
+    std::copy(
+      quadratic_values, quadratic_values + quadratic_size_values, qc.quadratic_values.data());
+  }
+  qc.quadratic_indices.resize(quadratic_size_indices);
+  if (quadratic_size_indices > 0) {
+    std::copy(
+      quadratic_indices, quadratic_indices + quadratic_size_indices, qc.quadratic_indices.data());
+  }
+  qc.quadratic_offsets.resize(quadratic_size_offsets);
+  std::copy(
+    quadratic_offsets, quadratic_offsets + quadratic_size_offsets, qc.quadratic_offsets.data());
 
   quadratic_constraints_.push_back(std::move(qc));
 }
