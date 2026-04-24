@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -275,7 +275,8 @@ class mps_data_model_t {
     /** ROWS declaration index (among all constraint rows), not an index into the linear CSR. */
     i_t constraint_row_index{};
     std::string constraint_row_name{};
-    /** MPS ROWS sense for this quadratic row; only 'L' (≤) is supported for convex QCQP at the moment. */
+    /** MPS ROWS sense for this quadratic row; only 'L' (≤) is supported for convex QCQP at the
+     * moment. */
     char constraint_row_type{};
     std::vector<f_t> linear_values{};
     std::vector<i_t> linear_indices{};

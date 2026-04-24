@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -236,8 +236,9 @@ void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_
                                                              const i_t* quadratic_offsets,
                                                              i_t quadratic_size_offsets)
 {
-  mps_parser_expects(
-    constraint_row_index >= 0, error_type_t::ValidationError, "constraint_row_index must be non-negative");
+  mps_parser_expects(constraint_row_index >= 0,
+                     error_type_t::ValidationError,
+                     "constraint_row_index must be non-negative");
 
   mps_parser_expects(constraint_row_type == 'L',
                      error_type_t::ValidationError,
@@ -249,24 +250,27 @@ void mps_data_model_t<i_t, f_t>::append_quadratic_constraint(i_t constraint_row_
                      error_type_t::ValidationError,
                      "linear_values and linear_indices must have the same nnz count");
   if (linear_nnz != 0) {
-    mps_parser_expects(
-      linear_values != nullptr && linear_indices != nullptr,
-      error_type_t::ValidationError,
-      "linear_values and linear_indices cannot be null when linear_nnz > 0");
+    mps_parser_expects(linear_values != nullptr && linear_indices != nullptr,
+                       error_type_t::ValidationError,
+                       "linear_values and linear_indices cannot be null when linear_nnz > 0");
   }
 
   if (quadratic_size_values != 0) {
-    mps_parser_expects(
-      quadratic_values != nullptr, error_type_t::ValidationError, "quadratic_values cannot be null");
+    mps_parser_expects(quadratic_values != nullptr,
+                       error_type_t::ValidationError,
+                       "quadratic_values cannot be null");
   }
-  mps_parser_expects(
-    quadratic_offsets != nullptr, error_type_t::ValidationError, "quadratic_offsets cannot be null");
+  mps_parser_expects(quadratic_offsets != nullptr,
+                     error_type_t::ValidationError,
+                     "quadratic_offsets cannot be null");
   if (quadratic_size_indices != 0) {
-    mps_parser_expects(
-      quadratic_indices != nullptr, error_type_t::ValidationError, "quadratic_indices cannot be null");
+    mps_parser_expects(quadratic_indices != nullptr,
+                       error_type_t::ValidationError,
+                       "quadratic_indices cannot be null");
   }
-  mps_parser_expects(
-    quadratic_size_offsets > 0, error_type_t::ValidationError, "quadratic_size_offsets cannot be empty");
+  mps_parser_expects(quadratic_size_offsets > 0,
+                     error_type_t::ValidationError,
+                     "quadratic_size_offsets cannot be empty");
 
   quadratic_constraint_t qc;
   qc.constraint_row_index = constraint_row_index;

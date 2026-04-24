@@ -16,8 +16,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <filesystem>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -878,31 +878,30 @@ TEST(qps_parser, qcmatrix_append_api)
   EXPECT_EQ(0.0, default_qcm.rhs_value);
 
   // QC0: [[10, 2], [2, 2]]
-  const std::vector<double> qc0_values  = {10.0, 2.0, 2.0, 2.0};
-  const std::vector<int> qc0_indices    = {0, 1, 0, 1};
-  const std::vector<int> qc0_offsets    = {0, 2, 4};
+  const std::vector<double> qc0_values        = {10.0, 2.0, 2.0, 2.0};
+  const std::vector<int> qc0_indices          = {0, 1, 0, 1};
+  const std::vector<int> qc0_offsets          = {0, 2, 4};
   const std::vector<double> qc0_linear_values = {1.0, 1.0};
   const std::vector<int> qc0_linear_indices   = {0, 1};
-  model.append_quadratic_constraint(
-    0,
-    "QC0",
-    'L',
-    qc0_linear_values.data(),
-    qc0_linear_values.size(),
-    qc0_linear_indices.data(),
-    qc0_linear_indices.size(),
-    5.0,
-    qc0_values.data(),
-    qc0_values.size(),
-    qc0_indices.data(),
-    qc0_indices.size(),
-    qc0_offsets.data(),
-    qc0_offsets.size());
+  model.append_quadratic_constraint(0,
+                                    "QC0",
+                                    'L',
+                                    qc0_linear_values.data(),
+                                    qc0_linear_values.size(),
+                                    qc0_linear_indices.data(),
+                                    qc0_linear_indices.size(),
+                                    5.0,
+                                    qc0_values.data(),
+                                    qc0_values.size(),
+                                    qc0_indices.data(),
+                                    qc0_indices.size(),
+                                    qc0_offsets.data(),
+                                    qc0_offsets.size());
 
   // QC1: [[4, 1], [1, 6]]
-  const std::vector<double> qc1_values  = {4.0, 1.0, 1.0, 6.0};
-  const std::vector<int> qc1_indices    = {0, 1, 0, 1};
-  const std::vector<int> qc1_offsets    = {0, 2, 4};
+  const std::vector<double> qc1_values        = {4.0, 1.0, 1.0, 6.0};
+  const std::vector<int> qc1_indices          = {0, 1, 0, 1};
+  const std::vector<int> qc1_offsets          = {0, 2, 4};
   const std::vector<double> qc1_linear_values = {3.0, 1.0};
   const std::vector<int> qc1_linear_indices   = {0, 1};
   model.append_quadratic_constraint(1,
@@ -1219,7 +1218,6 @@ void compare_data_models(const mps_data_model_t<i_t, f_t>& original,
       }
     }
   }
-
 }
 
 TEST(mps_roundtrip, linear_programming_basic)
@@ -1332,12 +1330,9 @@ TEST(mps_roundtrip, quadratic_programming_qp_test_2)
 
 TEST(mps_roundtrip, qcqp_p0033_qc1)
 {
-  if (!file_exists("qcqp/p0033_qc1.mps")) {
-    GTEST_SKIP() << "Test file not found";
-  }
+  if (!file_exists("qcqp/p0033_qc1.mps")) { GTEST_SKIP() << "Test file not found"; }
 
-  std::string input_file =
-    cuopt::test::get_rapids_dataset_root_dir() + "/qcqp/p0033_qc1.mps";
+  std::string input_file  = cuopt::test::get_rapids_dataset_root_dir() + "/qcqp/p0033_qc1.mps";
   std::string temp_file   = "/tmp/mps_roundtrip_p0033_qc1.mps";
   std::string temp_file_2 = "/tmp/mps_roundtrip_p0033_qc1_r2.mps";
 
