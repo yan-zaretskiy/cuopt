@@ -3818,6 +3818,9 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time,
     if (lp.Q.n > 0) {
       settings.log.printf("Quadratic objective matrix: %d nonzeros\n", lp.Q.row_start[lp.Q.n]);
     }
+    if (lp.second_order_cone_dims.size() > 0) {
+      settings.log.printf("Second-order cones: %d\n", static_cast<int>(lp.second_order_cone_dims.size()));
+    }
     settings.log.printf("\n");
 
     // Compute the number of free variables
