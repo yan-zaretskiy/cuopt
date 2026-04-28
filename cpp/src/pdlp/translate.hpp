@@ -15,6 +15,10 @@
 
 #include <utilities/copy_helpers.hpp>
 
+#include <limits>
+#include <type_traits>
+#include <vector>
+
 namespace cuopt::linear_programming {
 
 template <typename i_t, typename f_t>
@@ -110,18 +114,18 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
                   error_type_t::ValidationError,
                   "Quadratic-constraint flag is set, but no constraints were provided");
 
-    const i_t original_rows = static_cast<i_t>(user_problem.num_rows);
     // Use a practical tolerance for text-parsed MPS numeric values.
     const f_t tol = std::numeric_limits<f_t>::epsilon() * 2;
 
-    // SOC: Q is n×n diagonal CSR (offsets length n+1). Exactly q_n = nnz on the main diagonal, at
-    // q_n distinct variable indices: one −1 (head) and (q_n−1) +1 (tails). Lifting: q_n rows, each
-    // with −1 in one column; the **first** row must be the head (variable with Q = −1); order of
-    // remaining rows (+1 diagonals) is unconstrained (CSR row scan order).
-
-    const i_t old_nnz = csr_A.row_start[original_rows];
-    std::vector<i_t> row_cone_dims{};
-    row_cone_dims.reserve(qcs.size());
+    // SOC conversion accepts only diagonal Lorentz-form QCMATRIX rows:
+    //   -x_head^2 + sum_i x_tail_i^2 <= 0.
+    // The barrier consumes SOCs as trailing variable blocks [head, tails...], so we validate all
+    // QCMATRIX blocks first, then apply a single column permutation to the linear model.
+    std::vector<std::vector<i_t>> cone_vars;
+    std::vector<i_t> cone_dims;
+    std::vector<char> is_cone_var(static_cast<size_t>(n), 0);
+    cone_vars.reserve(qcs.size());
+    cone_dims.reserve(qcs.size());
 
     for (const auto& qc : qcs) {
       cuopt_expects(qc.constraint_row_type == 'L',
@@ -155,7 +159,7 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
       cuopt_expects(
         qc.quadratic_offsets.size() == static_cast<size_t>(n) + 1,
         error_type_t::ValidationError,
-        "Quadratic constraint '%s' Q must be n×n in CSR: expected %zu CSR row pointers (offsets "
+        "Quadratic constraint '%s' Q must be n by n in CSR: expected %zu CSR row pointers (offsets "
         "length n+1), got %zu (n = %d)",
         qc.constraint_row_name.c_str(),
         static_cast<size_t>(n) + 1,
@@ -174,7 +178,7 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
                     "Quadratic constraint '%s' Q CSR offsets[0] must be 0",
                     qc.constraint_row_name.c_str());
 
-      // Verify Q: n×n CSR, diagonal entries only, Lorentz pattern, then build the lift.
+      // Verify Q: n by n CSR, diagonal entries only, Lorentz pattern.
       // Scan each row r: empty or one nnz on (r,r) with value -1 (head) or +1 (tail);
       // tail order follows this scan; no requirement that diagonal indices be sorted.
       i_t head     = static_cast<i_t>(-1);
@@ -185,6 +189,13 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
       for (i_t r = 0; r < n; ++r) {
         const i_t p_beg = qc.quadratic_offsets[static_cast<size_t>(r)];
         const i_t p_end = qc.quadratic_offsets[static_cast<size_t>(r + 1)];
+        cuopt_expects(p_beg >= 0 && p_beg <= p_end && p_end <= q_n,
+                      error_type_t::ValidationError,
+                      "Quadratic constraint '%s' Q row %d has invalid CSR offsets [%d, %d)",
+                      qc.constraint_row_name.c_str(),
+                      static_cast<int>(r),
+                      static_cast<int>(p_beg),
+                      static_cast<int>(p_end));
 
         if (p_beg == p_end) { continue; }
 
@@ -247,44 +258,137 @@ static dual_simplex::user_problem_t<i_t, f_t> cuopt_problem_to_simplex_problem(
                     "Quadratic constraint '%s' SOC Q: internal error (head index invalid)",
                     qc.constraint_row_name.c_str());
 
-      row_cone_dims.push_back(q_n);
-      dual_simplex::csr_matrix_t<i_t, f_t> lift_block(q_n, n, q_n);
-      for (i_t t = 0; t <= q_n; ++t) {
-        lift_block.row_start[t] = t;
+      std::vector<i_t> cone;
+      cone.reserve(static_cast<size_t>(q_n));
+      cone.push_back(head);
+      cone.insert(cone.end(), tail_row_vars.begin(), tail_row_vars.end());
+      for (const i_t var : cone) {
+        cuopt_expects(!is_cone_var[static_cast<size_t>(var)],
+                      error_type_t::ValidationError,
+                      "Variable %d appears in more than one SOC QCMATRIX block; overlapping cones "
+                      "are not supported",
+                      static_cast<int>(var));
+        is_cone_var[static_cast<size_t>(var)] = 1;
       }
-
-      // One lift row per cone component: -1 in column head, then -1 in each tail column (since our
-      // slack variable is done by + s form) (order matches tail_row_vars from the Q scan).
-      lift_block.j[0] = head;
-      lift_block.x[0] = f_t(-1);
-      for (i_t t = 0; t < q_n - 1; ++t) {
-        lift_block.j[static_cast<size_t>(t) + 1U] = tail_row_vars[static_cast<size_t>(t)];
-        lift_block.x[static_cast<size_t>(t) + 1U] = f_t(-1);
-      }
-      cuopt_expects(csr_A.append_rows(lift_block) == 0,
-                    error_type_t::RuntimeError,
-                    "Internal error while appending SOC lifting rows to CSR A");
+      cone_dims.push_back(q_n);
+      cone_vars.push_back(std::move(cone));
     }
 
-    // Update user_problem to include the new SOC rows
-    const i_t next_row    = static_cast<i_t>(csr_A.m);
-    const i_t lifted_rows = next_row - original_rows;
-    const i_t new_nnz     = old_nnz + lifted_rows;
-    cuopt_expects(csr_A.row_start[next_row] == new_nnz,
+    std::vector<i_t> old_to_new(static_cast<size_t>(n), i_t{-1});
+    std::vector<i_t> new_to_old;
+    new_to_old.reserve(static_cast<size_t>(n));
+    for (i_t j = 0; j < n; ++j) {
+      if (is_cone_var[static_cast<size_t>(j)]) { continue; }
+      old_to_new[static_cast<size_t>(j)] = static_cast<i_t>(new_to_old.size());
+      new_to_old.push_back(j);
+    }
+    const i_t cone_var_start = static_cast<i_t>(new_to_old.size());
+    for (const auto& cone : cone_vars) {
+      for (const i_t old_j : cone) {
+        old_to_new[static_cast<size_t>(old_j)] = static_cast<i_t>(new_to_old.size());
+        new_to_old.push_back(old_j);
+      }
+    }
+    cuopt_expects(static_cast<i_t>(new_to_old.size()) == n,
                   error_type_t::RuntimeError,
-                  "Internal error while building SOC lifting rows in CSR A");
+                  "Internal error while building SOC variable permutation");
 
-    user_problem.rhs.resize(next_row, f_t(0));
-    user_problem.row_sense.resize(next_row, 'E');
-    if (user_problem.row_names.size() == static_cast<size_t>(original_rows)) {
-      for (i_t r = original_rows; r < next_row; ++r) {
-        user_problem.row_names.push_back("_CUOPT_soc_row_" + std::to_string(r - original_rows));
+    for (i_t row = 0; row < csr_A.m; ++row) {
+      for (i_t p = csr_A.row_start[static_cast<size_t>(row)];
+           p < csr_A.row_start[static_cast<size_t>(row + 1)];
+           ++p) {
+        const i_t old_j = csr_A.j[static_cast<size_t>(p)];
+        cuopt_expects(old_j >= 0 && old_j < n,
+                      error_type_t::ValidationError,
+                      "Linear constraint matrix column index %d is outside [0, %d)",
+                      static_cast<int>(old_j),
+                      static_cast<int>(n));
+        csr_A.j[static_cast<size_t>(p)] = old_to_new[static_cast<size_t>(old_j)];
       }
     }
-    user_problem.num_rows = next_row;
 
-    user_problem.cone_row_start             = original_rows;
-    user_problem.second_order_cone_row_dims = std::move(row_cone_dims);
+    auto permute_dense_by_old_to_new = [&](auto& values, const char* name) {
+      if (values.empty()) { return; }
+      using value_t = typename std::decay_t<decltype(values)>::value_type;
+      cuopt_expects(values.size() == static_cast<size_t>(n),
+                    error_type_t::ValidationError,
+                    "%s length %zu does not match number of variables %d",
+                    name,
+                    values.size(),
+                    static_cast<int>(n));
+      std::vector<value_t> permuted(values.size());
+      for (i_t old_j = 0; old_j < n; ++old_j) {
+        permuted[static_cast<size_t>(old_to_new[static_cast<size_t>(old_j)])] =
+          std::move(values[static_cast<size_t>(old_j)]);
+      }
+      values = std::move(permuted);
+    };
+
+    permute_dense_by_old_to_new(user_problem.objective, "objective");
+    permute_dense_by_old_to_new(user_problem.lower, "lower bounds");
+    permute_dense_by_old_to_new(user_problem.upper, "upper bounds");
+    permute_dense_by_old_to_new(user_problem.var_types, "variable types");
+    permute_dense_by_old_to_new(user_problem.col_names, "column names");
+
+    if (!user_problem.Q_values.empty()) {
+      cuopt_expects(user_problem.Q_indices.size() == user_problem.Q_values.size(),
+                    error_type_t::ValidationError,
+                    "Quadratic objective indices and values length mismatch");
+      cuopt_expects(user_problem.Q_offsets.size() == static_cast<size_t>(n) + 1,
+                    error_type_t::ValidationError,
+                    "Quadratic objective CSR offsets length must be n+1 when SOC QCMATRIX "
+                    "conversion permutes variables");
+      cuopt_expects(user_problem.Q_offsets[0] == 0,
+                    error_type_t::ValidationError,
+                    "Quadratic objective CSR offsets[0] must be 0");
+      cuopt_expects(user_problem.Q_offsets[static_cast<size_t>(n)] ==
+                      static_cast<i_t>(user_problem.Q_values.size()),
+                    error_type_t::ValidationError,
+                    "Quadratic objective CSR last offset must equal number of nonzeros");
+
+      std::vector<i_t> q_offsets(static_cast<size_t>(n) + 1, 0);
+      for (i_t old_row = 0; old_row < n; ++old_row) {
+        const i_t p_beg = user_problem.Q_offsets[static_cast<size_t>(old_row)];
+        const i_t p_end = user_problem.Q_offsets[static_cast<size_t>(old_row + 1)];
+        cuopt_expects(
+          p_beg >= 0 && p_beg <= p_end && p_end <= static_cast<i_t>(user_problem.Q_values.size()),
+          error_type_t::ValidationError,
+          "Quadratic objective CSR offsets are invalid at row %d",
+          static_cast<int>(old_row));
+        const i_t new_row                           = old_to_new[static_cast<size_t>(old_row)];
+        q_offsets[static_cast<size_t>(new_row + 1)] = p_end - p_beg;
+      }
+      for (i_t row = 0; row < n; ++row) {
+        q_offsets[static_cast<size_t>(row + 1)] += q_offsets[static_cast<size_t>(row)];
+      }
+
+      std::vector<i_t> q_indices(user_problem.Q_indices.size());
+      std::vector<f_t> q_values(user_problem.Q_values.size());
+      auto q_write = q_offsets;
+      for (i_t old_row = 0; old_row < n; ++old_row) {
+        const i_t new_row = old_to_new[static_cast<size_t>(old_row)];
+        for (i_t p = user_problem.Q_offsets[static_cast<size_t>(old_row)];
+             p < user_problem.Q_offsets[static_cast<size_t>(old_row + 1)];
+             ++p) {
+          const i_t old_col = user_problem.Q_indices[static_cast<size_t>(p)];
+          cuopt_expects(old_col >= 0 && old_col < n,
+                        error_type_t::ValidationError,
+                        "Quadratic objective column index %d is outside [0, %d)",
+                        static_cast<int>(old_col),
+                        static_cast<int>(n));
+          const i_t dst                       = q_write[static_cast<size_t>(new_row)]++;
+          q_indices[static_cast<size_t>(dst)] = old_to_new[static_cast<size_t>(old_col)];
+          q_values[static_cast<size_t>(dst)]  = user_problem.Q_values[static_cast<size_t>(p)];
+        }
+      }
+
+      user_problem.Q_offsets = std::move(q_offsets);
+      user_problem.Q_indices = std::move(q_indices);
+      user_problem.Q_values  = std::move(q_values);
+    }
+
+    user_problem.cone_var_start         = cone_var_start;
+    user_problem.second_order_cone_dims = std::move(cone_dims);
   }
 
   csr_A.to_compressed_col(user_problem.A);

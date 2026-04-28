@@ -38,48 +38,6 @@ namespace cuopt::linear_programming::dual_simplex {
 namespace {
 
 template <typename i_t, typename f_t>
-bool validate_second_order_cone_row_metadata(const user_problem_t<i_t, f_t>& user_problem,
-                                             const simplex_solver_settings_t<i_t, f_t>& settings)
-{
-  if (user_problem.second_order_cone_row_dims.empty()) { return true; }
-
-  i_t lifted_row_count = 0;
-  for (auto q_k : user_problem.second_order_cone_row_dims) {
-    if (q_k < 0) {
-      settings.log.printf("Error: second-order cone row dimensions must be nonnegative\n");
-      return false;
-    }
-    lifted_row_count += q_k;
-  }
-
-  if (user_problem.cone_row_start < 0) {
-    settings.log.printf("Error: cone_row_start must be nonnegative\n");
-    return false;
-  }
-
-  const i_t cone_row_end = user_problem.cone_row_start + lifted_row_count;
-  if (cone_row_end > user_problem.num_rows) {
-    settings.log.printf("Error: second-order cone row block exceeds the number of rows\n");
-    return false;
-  }
-
-  if (user_problem.num_range_rows > static_cast<i_t>(user_problem.range_rows.size())) {
-    settings.log.printf("Error: range row metadata is inconsistent\n");
-    return false;
-  }
-
-  for (i_t k = 0; k < user_problem.num_range_rows; ++k) {
-    const i_t row = user_problem.range_rows[k];
-    if (row >= user_problem.cone_row_start && row < cone_row_end) {
-      settings.log.printf("Error: range rows cannot intersect the second-order cone row block\n");
-      return false;
-    }
-  }
-
-  return true;
-}
-
-template <typename i_t, typename f_t>
 void write_matlab(const std::string& filename, const dual_simplex::lp_problem_t<i_t, f_t>& lp)
 {
   FILE* fid = fopen(filename.c_str(), "w");
@@ -429,9 +387,6 @@ lp_status_t solve_linear_program_with_barrier(const user_problem_t<i_t, f_t>& us
   simplex_solver_settings_t<i_t, f_t> barrier_settings = settings;
   barrier_settings.barrier_presolve                    = true;
   dualize_info_t<i_t, f_t> dualize_info;
-  if (!validate_second_order_cone_row_metadata(user_problem, settings)) {
-    return lp_status_t::NUMERICAL_ISSUES;
-  }
   convert_user_problem(user_problem, barrier_settings, original_lp, new_slacks, dualize_info);
   if (!validate_barrier_cone_layout(original_lp, settings)) {
     return lp_status_t::NUMERICAL_ISSUES;

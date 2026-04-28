@@ -2626,8 +2626,9 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       RAFT_CHECK_CUDA(stream_view_);
     }
 
-    // diag = z ./ x + E * (v ./ w) * E' + Q (if Q is diagonal)
-    if (data.Q.n > 0 && data.Q_diagonal) {
+    // In ADAT mode, diagonal Q is folded into D. In augmented mode, Q is an explicit block in the
+    // KKT matrix, so adding it here would double count the quadratic objective.
+    if (!use_augmented && data.Q.n > 0 && data.Q_diagonal) {
       cub::DeviceTransform::Transform(
         cuda::std::make_tuple(data.d_Q_diag_.data(), data.d_diag_.data()),
         data.d_diag_.data(),

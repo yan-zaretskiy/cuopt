@@ -15,7 +15,6 @@
 
 #include <cmath>
 #include <iostream>
-#include <numeric>
 
 namespace cuopt::linear_programming::dual_simplex {
 
@@ -23,68 +22,6 @@ template <typename i_t, typename f_t>
 static i_t linear_var_count(const lp_problem_t<i_t, f_t>& problem)
 {
   return problem.second_order_cone_dims.empty() ? problem.num_cols : problem.cone_var_start;
-}
-
-template <typename i_t, typename f_t>
-static void lift_second_order_cone_rows(const user_problem_t<i_t, f_t>& user_problem,
-                                        std::vector<char>& row_sense,
-                                        lp_problem_t<i_t, f_t>& problem)
-{
-  if (user_problem.second_order_cone_row_dims.empty()) { return; }
-
-  auto& dims                 = user_problem.second_order_cone_row_dims;
-  const i_t lifted_row_count = std::accumulate(dims.begin(), dims.end(), i_t{0});
-  const i_t cone_row_start   = user_problem.cone_row_start;
-
-  const i_t old_num_cols = problem.num_cols;
-  const i_t new_num_cols = old_num_cols + lifted_row_count;
-  const i_t old_nnz      = problem.A.col_start[old_num_cols];
-  const i_t new_nnz      = old_nnz + lifted_row_count;
-
-  auto old_A = problem.A;
-  csc_matrix_t<i_t, f_t> lifted_A(problem.num_rows, new_num_cols, new_nnz);
-
-  i_t nz = 0;
-  for (i_t j = 0; j < old_num_cols; ++j) {
-    lifted_A.col_start[j] = nz;
-    for (i_t p = old_A.col_start[j]; p < old_A.col_start[j + 1]; ++p) {
-      lifted_A.i[nz] = old_A.i[p];
-      lifted_A.x[nz] = old_A.x[p];
-      ++nz;
-    }
-  }
-
-  for (i_t offset = 0; offset < lifted_row_count; ++offset) {
-    const i_t j           = old_num_cols + offset;
-    const i_t row         = cone_row_start + offset;
-    lifted_A.col_start[j] = nz;
-    lifted_A.i[nz]        = row;
-    lifted_A.x[nz]        = 1.0;
-    row_sense[row]        = 'E';
-    ++nz;
-  }
-  lifted_A.col_start[new_num_cols] = nz;
-  assert(nz == new_nnz);
-
-  std::vector<f_t> objective(new_num_cols, 0.0);
-  std::vector<f_t> lower(new_num_cols, 0.0);
-  std::vector<f_t> upper(new_num_cols, inf);
-  for (i_t j = 0; j < old_num_cols; ++j) {
-    objective[j] = problem.objective[j];
-    lower[j]     = problem.lower[j];
-    upper[j]     = problem.upper[j];
-  }
-
-  problem.A         = lifted_A;
-  problem.A.n       = new_num_cols;
-  problem.objective = objective;
-  problem.lower     = lower;
-  problem.upper     = upper;
-  problem.num_cols  = new_num_cols;
-  if (problem.second_order_cone_dims.empty()) { problem.cone_var_start = old_num_cols; }
-  problem.second_order_cone_dims.insert(problem.second_order_cone_dims.end(),
-                                        user_problem.second_order_cone_row_dims.begin(),
-                                        user_problem.second_order_cone_row_dims.end());
 }
 
 template <typename i_t, typename f_t>
@@ -759,9 +696,6 @@ void convert_user_problem(const user_problem_t<i_t, f_t>& user_problem,
 
   // Make a copy of row_sense so we can modify it
   std::vector<char> row_sense = user_problem.row_sense;
-  if (settings.barrier && !user_problem.second_order_cone_row_dims.empty()) {
-    lift_second_order_cone_rows(user_problem, row_sense, problem);
-  }
 
   // The original problem can have constraints in the form
   // a_i^T x >= b, a_i^T x <= b, and a_i^T x == b
